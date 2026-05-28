@@ -20,8 +20,18 @@ import sys
 from dataclasses import dataclass, asdict
 from typing import Iterable
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ModuleNotFoundError as error:
+    if error.name not in {"boto3", "botocore"}:
+        raise
+
+    boto3 = None
+    BotoCoreError = ClientError = Exception
+    IMPORT_ERROR = error
+else:
+    IMPORT_ERROR = None
 
 
 MIN_MYSQL = (8, 4, 7)
@@ -56,6 +66,18 @@ def parse_args() -> argparse.Namespace:
         help="Print findings as JSON instead of a table.",
     )
     return parser.parse_args()
+
+
+def validate_dependencies() -> bool:
+    if IMPORT_ERROR is None:
+        return True
+
+    print(
+        f"Missing required Python package '{IMPORT_ERROR.name}'.",
+        file=sys.stderr,
+    )
+    print("Install the AWS SDK with: python3 -m pip install boto3", file=sys.stderr)
+    return False
 
 
 def version_tuple(version: str) -> tuple[int, ...]:
@@ -203,6 +225,9 @@ def print_table(findings: list[Finding]) -> None:
 
 def main() -> int:
     args = parse_args()
+    if not validate_dependencies():
+        return 2
+
     session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
 
     try:
