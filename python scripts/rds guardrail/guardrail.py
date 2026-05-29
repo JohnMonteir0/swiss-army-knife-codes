@@ -5,7 +5,7 @@ RDS version guardrail.
 Finds RDS and Aurora resources running below these approved versions:
   - MySQL: 8.4.7
   - Aurora MySQL: 8.0.mysql_aurora.3.10.3
-  - PostgreSQL / Aurora PostgreSQL: major version 17
+  - PostgreSQL: major version 17
 
 Works in two places:
   - Local CLI
@@ -58,11 +58,6 @@ POLICY = {
         "minimum_major": 17,
         "required": "17",
         "message": "PostgreSQL major version is below 17",
-    },
-    "aurora-postgresql": {
-        "minimum_major": 17,
-        "required": "17",
-        "message": "Aurora PostgreSQL major version is below 17",
     },
 }
 
