@@ -80,4 +80,4 @@ Scan all enabled commercial regions:
 {}
 ```
 
-The Lambda returns `PASS` when no outdated resources are found. It fails the invocation when it finds outdated resources or cannot scan a region.
+The Lambda returns `PASS` when no outdated resources are found, `FAIL` when outdated resources are found, and `ERROR` when one or more regions could not be scanned.

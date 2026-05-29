@@ -213,14 +213,7 @@ def print_table(findings):
 def lambda_handler(event, context):
     event = event or {}
     regions = event.get("regions")
-    result = scan_account(regions=regions)
-
-    # Raising an exception marks the Lambda invocation as failed, which is useful
-    # when the function runs as a CI/CD or EventBridge guardrail.
-    if result["findings"] or result["errors"]:
-        raise Exception(json.dumps(result, default=str))
-
-    return result
+    return scan_account(regions=regions)
 
 
 def parse_args():
