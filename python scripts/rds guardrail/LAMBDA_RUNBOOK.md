@@ -85,26 +85,15 @@ Scan all enabled commercial regions:
 {}
 ```
 
-Delete outdated resources in specific regions and skip final snapshots:
+Delete outdated resources in specific regions:
 
 ```json
 {
   "regions": ["us-east-1", "us-west-2"],
-  "delete_outdated": true,
-  "skip_final_snapshot": true
+  "delete_outdated": true
 }
 ```
 
-Delete outdated resources and create final snapshots:
-
-```json
-{
-  "regions": ["us-east-1", "us-west-2"],
-  "delete_outdated": true,
-  "final_snapshot_prefix": "rds-guardrail-final"
-}
-```
-
-When deletion is enabled, the Lambda removes RDS deletion protection from each outdated resource before requesting deletion.
+When deletion is enabled, the Lambda identifies whether each outdated resource is a DB instance or DB cluster, removes RDS deletion protection when it is enabled, and requests deletion with final snapshots skipped. It does not delete existing snapshots.
 
 The Lambda returns `PASS` when no outdated resources are found, `FAIL` when outdated resources are found, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more regions or delete operations failed.
