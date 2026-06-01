@@ -1,6 +1,7 @@
 # RDS Guardrail Lambda Runbook
 
 This Lambda scans RDS DB instances and DB clusters for engine versions below the policy in `guardrail.py`.
+It can also delete outdated resources when `delete_outdated` is explicitly enabled.
 
 ## Lambda Settings
 
@@ -22,7 +23,11 @@ Attach this policy to the Lambda execution role:
       "Action": [
         "ec2:DescribeRegions",
         "rds:DescribeDBInstances",
-        "rds:DescribeDBClusters"
+        "rds:DescribeDBClusters",
+        "rds:ModifyDBInstance",
+        "rds:ModifyDBCluster",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBCluster"
       ],
       "Resource": "*"
     },
@@ -80,4 +85,26 @@ Scan all enabled commercial regions:
 {}
 ```
 
-The Lambda returns `PASS` when no outdated resources are found, `FAIL` when outdated resources are found, and `ERROR` when one or more regions could not be scanned.
+Delete outdated resources in specific regions and skip final snapshots:
+
+```json
+{
+  "regions": ["us-east-1", "us-west-2"],
+  "delete_outdated": true,
+  "skip_final_snapshot": true
+}
+```
+
+Delete outdated resources and create final snapshots:
+
+```json
+{
+  "regions": ["us-east-1", "us-west-2"],
+  "delete_outdated": true,
+  "final_snapshot_prefix": "rds-guardrail-final"
+}
+```
+
+When deletion is enabled, the Lambda removes RDS deletion protection from each outdated resource before requesting deletion.
+
+The Lambda returns `PASS` when no outdated resources are found, `FAIL` when outdated resources are found, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more regions or delete operations failed.

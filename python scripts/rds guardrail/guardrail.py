@@ -18,9 +18,11 @@ Examples:
   python guardrail.py
   python guardrail.py --profile my-profile
   python guardrail.py --regions us-east-1 us-west-2 --json
+  python guardrail.py --delete-outdated --skip-final-snapshot
 
 Lambda event example:
   {"regions": ["us-east-1", "us-west-2"]}
+  {"regions": ["us-east-1"], "delete_outdated": true, "skip_final_snapshot": true}
 """
 
 import argparse
@@ -67,12 +69,18 @@ RDS_RESOURCES = [
         "result_key": "DBInstances",
         "type": "DBInstance",
         "id_key": "DBInstanceIdentifier",
+        "delete_api": "delete_db_instance",
+        "modify_api": "modify_db_instance",
+        "id_arg": "DBInstanceIdentifier",
     },
     {
         "api": "describe_db_clusters",
         "result_key": "DBClusters",
         "type": "DBCluster",
         "id_key": "DBClusterIdentifier",
+        "delete_api": "delete_db_cluster",
+        "modify_api": "modify_db_cluster",
+        "id_arg": "DBClusterIdentifier",
     },
 ]
 
@@ -141,6 +149,7 @@ def scan_region(session, region):
                     "identifier": item.get(resource["id_key"], ""),
                     "engine": engine,
                     "engine_version": engine_version,
+                    "deletion_protection": item.get("DeletionProtection", False),
                     **failed_policy,
                 }
             )
@@ -148,7 +157,85 @@ def scan_region(session, region):
     return findings
 
 
-def scan_account(session=None, regions=None):
+def snapshot_identifier(prefix, finding):
+    base = f"{prefix}-{finding['resource_type']}-{finding['identifier']}"
+    normalized = re.sub(r"[^a-zA-Z0-9-]", "-", base).strip("-")
+    return normalized[:255]
+
+
+def delete_finding(rds, finding, skip_final_snapshot, final_snapshot_prefix):
+    resource = next(
+        item for item in RDS_RESOURCES if item["type"] == finding["resource_type"]
+    )
+    identifier = finding["identifier"]
+    action = {
+        "region": finding["region"],
+        "resource_type": finding["resource_type"],
+        "identifier": identifier,
+        "deletion_protection_removed": False,
+        "status": "DELETE_REQUESTED",
+    }
+
+    if finding.get("deletion_protection"):
+        getattr(rds, resource["modify_api"])(
+            **{
+                resource["id_arg"]: identifier,
+                "DeletionProtection": False,
+                "ApplyImmediately": True,
+            }
+        )
+        action["deletion_protection_removed"] = True
+
+    delete_args = {
+        resource["id_arg"]: identifier,
+        "SkipFinalSnapshot": skip_final_snapshot,
+    }
+    if not skip_final_snapshot:
+        delete_args["FinalDBSnapshotIdentifier"] = snapshot_identifier(
+            final_snapshot_prefix, finding
+        )
+
+    getattr(rds, resource["delete_api"])(**delete_args)
+    return action
+
+
+def delete_findings(session, findings, skip_final_snapshot, final_snapshot_prefix):
+    actions = []
+    errors = []
+    clients = {}
+
+    for finding in findings:
+        region = finding["region"]
+        try:
+            clients.setdefault(region, session.client("rds", region_name=region))
+            actions.append(
+                delete_finding(
+                    clients[region],
+                    finding,
+                    skip_final_snapshot,
+                    final_snapshot_prefix,
+                )
+            )
+        except (BotoCoreError, ClientError) as error:
+            errors.append(
+                {
+                    "region": region,
+                    "resource_type": finding["resource_type"],
+                    "identifier": finding["identifier"],
+                    "error": str(error),
+                }
+            )
+
+    return actions, errors
+
+
+def scan_account(
+    session=None,
+    regions=None,
+    delete_outdated=False,
+    skip_final_snapshot=False,
+    final_snapshot_prefix="rds-guardrail-final",
+):
     if IMPORT_ERROR is not None:
         raise RuntimeError(f"Missing required Python package: {IMPORT_ERROR.name}")
 
@@ -163,12 +250,24 @@ def scan_account(session=None, regions=None):
         except (BotoCoreError, ClientError) as error:
             errors.append({"region": region, "error": str(error)})
 
+    delete_actions = []
+    if delete_outdated and findings:
+        actions, delete_errors = delete_findings(
+            session, findings, skip_final_snapshot, final_snapshot_prefix
+        )
+        delete_actions.extend(actions)
+        errors.extend(delete_errors)
+
     status = "ERROR" if errors else "FAIL" if findings else "PASS"
+    if delete_outdated and findings and not errors:
+        status = "DELETE_REQUESTED"
 
     return {
         "status": status,
         "finding_count": len(findings),
         "findings": findings,
+        "delete_action_count": len(delete_actions),
+        "delete_actions": delete_actions,
         "errors": errors,
     }
 
@@ -213,7 +312,14 @@ def print_table(findings):
 def lambda_handler(event, context):
     event = event or {}
     regions = event.get("regions")
-    return scan_account(regions=regions)
+    return scan_account(
+        regions=regions,
+        delete_outdated=event.get("delete_outdated", False),
+        skip_final_snapshot=event.get("skip_final_snapshot", False),
+        final_snapshot_prefix=event.get(
+            "final_snapshot_prefix", "rds-guardrail-final"
+        ),
+    )
 
 
 def parse_args():
@@ -223,6 +329,21 @@ def parse_args():
     parser.add_argument("--profile", help="AWS profile name to use.")
     parser.add_argument("--regions", nargs="+", help="AWS regions to scan.")
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    parser.add_argument(
+        "--delete-outdated",
+        action="store_true",
+        help="Delete DB instances and clusters that are below the configured policy.",
+    )
+    parser.add_argument(
+        "--skip-final-snapshot",
+        action="store_true",
+        help="Delete outdated resources without creating final snapshots.",
+    )
+    parser.add_argument(
+        "--final-snapshot-prefix",
+        default="rds-guardrail-final",
+        help="Prefix for final snapshots when --skip-final-snapshot is not used.",
+    )
     return parser.parse_args()
 
 
@@ -235,7 +356,13 @@ def main() -> int:
         return 2
 
     session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
-    result = scan_account(session=session, regions=args.regions)
+    result = scan_account(
+        session=session,
+        regions=args.regions,
+        delete_outdated=args.delete_outdated,
+        skip_final_snapshot=args.skip_final_snapshot,
+        final_snapshot_prefix=args.final_snapshot_prefix,
+    )
 
     if result["errors"]:
         print(json.dumps(result["errors"], indent=2), file=sys.stderr)
@@ -244,6 +371,9 @@ def main() -> int:
         print(json.dumps(result, indent=2))
     else:
         print_table(result["findings"])
+        if result["delete_actions"]:
+            print()
+            print(f"Delete requested for {result['delete_action_count']} resources.")
 
     if result["errors"]:
         return 2
