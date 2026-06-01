@@ -22,13 +22,14 @@ Examples:
 
 Lambda event example:
   {"regions": ["us-east-1", "us-west-2"]}
-  {"regions": ["us-east-1"], "delete_outdated": true}
+  {"regions": ["us-east-1"], "status_retry_attempts": 20}
 """
 
 import argparse
 import json
 import re
 import sys
+import time
 
 try:
     import boto3
@@ -63,12 +64,16 @@ POLICY = {
     },
 }
 
+DEFAULT_STATUS_RETRY_ATTEMPTS = 20
+DEFAULT_STATUS_RETRY_DELAY_SECONDS = 15
+
 RDS_RESOURCES = [
     {
         "api": "describe_db_instances",
         "result_key": "DBInstances",
         "type": "DBInstance",
         "id_key": "DBInstanceIdentifier",
+        "status_key": "DBInstanceStatus",
         "delete_api": "delete_db_instance",
         "modify_api": "modify_db_instance",
         "id_arg": "DBInstanceIdentifier",
@@ -78,11 +83,16 @@ RDS_RESOURCES = [
         "result_key": "DBClusters",
         "type": "DBCluster",
         "id_key": "DBClusterIdentifier",
+        "status_key": "Status",
         "delete_api": "delete_db_cluster",
         "modify_api": "modify_db_cluster",
         "id_arg": "DBClusterIdentifier",
     },
 ]
+
+
+class RDSStatusTimeoutError(RuntimeError):
+    pass
 
 
 def numbers(version):
@@ -147,6 +157,7 @@ def scan_region(session, region):
                     "region": region,
                     "resource_type": resource["type"],
                     "identifier": item.get(resource["id_key"], ""),
+                    "status": item.get(resource["status_key"], ""),
                     "engine": engine,
                     "engine_version": engine_version,
                     "deletion_protection": item.get("DeletionProtection", False),
@@ -157,22 +168,89 @@ def scan_region(session, region):
     return findings
 
 
-def delete_finding(rds, finding):
+def describe_resource(rds, resource, identifier):
+    response = getattr(rds, resource["api"])(
+        **{resource["id_arg"]: identifier}
+    )
+    items = response.get(resource["result_key"], [])
+    return items[0] if items else None
+
+
+def wait_until_available(
+    rds,
+    resource,
+    identifier,
+    retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
+    retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    expected_deletion_protection=None,
+):
+    retry_attempts = max(int(retry_attempts), 1)
+    retry_delay_seconds = max(int(retry_delay_seconds), 0)
+    last_status = None
+    last_deletion_protection = None
+
+    for attempt in range(1, retry_attempts + 1):
+        item = describe_resource(rds, resource, identifier)
+        if item is None:
+            raise RDSStatusTimeoutError(
+                f"{resource['type']} {identifier} was not found while checking status."
+            )
+
+        last_status = item.get(resource["status_key"], "")
+        last_deletion_protection = item.get("DeletionProtection", False)
+        deletion_protection_matches = (
+            expected_deletion_protection is None
+            or last_deletion_protection == expected_deletion_protection
+        )
+        if last_status == "available" and deletion_protection_matches:
+            return item, attempt
+
+        if attempt < retry_attempts and retry_delay_seconds:
+            time.sleep(retry_delay_seconds)
+
+    extra_status = ""
+    if expected_deletion_protection is not None:
+        extra_status = (
+            f" Last deletion protection: {last_deletion_protection}."
+        )
+
+    raise RDSStatusTimeoutError(
+        f"{resource['type']} {identifier} did not become available after "
+        f"{retry_attempts} status checks. Last status: {last_status or 'unknown'}."
+        f"{extra_status}"
+    )
+
+
+def delete_finding(
+    rds,
+    finding,
+    status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
+    status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+):
     resource = next(
         item for item in RDS_RESOURCES if item["type"] == finding["resource_type"]
     )
     identifier = finding["identifier"]
+    item, status_checks = wait_until_available(
+        rds,
+        resource,
+        identifier,
+        retry_attempts=status_retry_attempts,
+        retry_delay_seconds=status_retry_delay_seconds,
+    )
     action = {
         "region": finding["region"],
         "resource_type": finding["resource_type"],
         "identifier": identifier,
+        "pre_delete_status": item.get(resource["status_key"], ""),
+        "status_checks": status_checks,
         "deletion_protection_removed": False,
         "final_snapshot_skipped": True,
         "snapshots_deleted": False,
         "status": "DELETE_REQUESTED",
     }
 
-    if finding.get("deletion_protection"):
+    if item.get("DeletionProtection", False):
         getattr(rds, resource["modify_api"])(
             **{
                 resource["id_arg"]: identifier,
@@ -181,6 +259,16 @@ def delete_finding(rds, finding):
             }
         )
         action["deletion_protection_removed"] = True
+        item, protection_status_checks = wait_until_available(
+            rds,
+            resource,
+            identifier,
+            retry_attempts=status_retry_attempts,
+            retry_delay_seconds=status_retry_delay_seconds,
+            expected_deletion_protection=False,
+        )
+        action["pre_delete_status"] = item.get(resource["status_key"], "")
+        action["status_checks"] += protection_status_checks
 
     delete_args = {
         resource["id_arg"]: identifier,
@@ -191,7 +279,12 @@ def delete_finding(rds, finding):
     return action
 
 
-def delete_findings(session, findings):
+def delete_findings(
+    session,
+    findings,
+    status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
+    status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+):
     actions = []
     errors = []
     clients = {}
@@ -200,8 +293,15 @@ def delete_findings(session, findings):
         region = finding["region"]
         try:
             clients.setdefault(region, session.client("rds", region_name=region))
-            actions.append(delete_finding(clients[region], finding))
-        except (BotoCoreError, ClientError) as error:
+            actions.append(
+                delete_finding(
+                    clients[region],
+                    finding,
+                    status_retry_attempts=status_retry_attempts,
+                    status_retry_delay_seconds=status_retry_delay_seconds,
+                )
+            )
+        except (BotoCoreError, ClientError, RDSStatusTimeoutError) as error:
             errors.append(
                 {
                     "region": region,
@@ -218,6 +318,8 @@ def scan_account(
     session=None,
     regions=None,
     delete_outdated=False,
+    status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
+    status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
 ):
     if IMPORT_ERROR is not None:
         raise RuntimeError(f"Missing required Python package: {IMPORT_ERROR.name}")
@@ -235,7 +337,12 @@ def scan_account(
 
     delete_actions = []
     if delete_outdated and findings:
-        actions, delete_errors = delete_findings(session, findings)
+        actions, delete_errors = delete_findings(
+            session,
+            findings,
+            status_retry_attempts=status_retry_attempts,
+            status_retry_delay_seconds=status_retry_delay_seconds,
+        )
         delete_actions.extend(actions)
         errors.extend(delete_errors)
 
@@ -295,7 +402,13 @@ def lambda_handler(event, context):
     regions = event.get("regions")
     return scan_account(
         regions=regions,
-        delete_outdated=event.get("delete_outdated", False),
+        delete_outdated=True,
+        status_retry_attempts=event.get(
+            "status_retry_attempts", DEFAULT_STATUS_RETRY_ATTEMPTS
+        ),
+        status_retry_delay_seconds=event.get(
+            "status_retry_delay_seconds", DEFAULT_STATUS_RETRY_DELAY_SECONDS
+        ),
     )
 
 
@@ -314,6 +427,18 @@ def parse_args():
             "policy. Final snapshots are always skipped."
         ),
     )
+    parser.add_argument(
+        "--status-retry-attempts",
+        type=int,
+        default=DEFAULT_STATUS_RETRY_ATTEMPTS,
+        help="Number of status checks before deleting a resource.",
+    )
+    parser.add_argument(
+        "--status-retry-delay-seconds",
+        type=int,
+        default=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+        help="Seconds to wait between RDS status checks.",
+    )
     return parser.parse_args()
 
 
@@ -330,6 +455,8 @@ def main() -> int:
         session=session,
         regions=args.regions,
         delete_outdated=args.delete_outdated,
+        status_retry_attempts=args.status_retry_attempts,
+        status_retry_delay_seconds=args.status_retry_delay_seconds,
     )
 
     if result["errors"]:
