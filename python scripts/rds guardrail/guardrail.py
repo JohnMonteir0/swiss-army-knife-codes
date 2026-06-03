@@ -22,7 +22,7 @@ Examples:
 
 Lambda event example:
   {"regions": ["us-east-1", "us-west-2"]}
-  {"regions": ["us-east-1"], "status_retry_attempts": 20}
+  {"regions": ["us-east-1"], "status_wait_timeout_seconds": 840}
   {"targets": [{"region": "us-east-1", "resource_type": "DBInstance", "identifier": "test-db"}]}
 """
 
@@ -67,6 +67,8 @@ POLICY = {
 
 DEFAULT_STATUS_RETRY_ATTEMPTS = 20
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = 15
+DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS = 840
+LAMBDA_TIMEOUT_BUFFER_SECONDS = 20
 RDS_EVENT_SOURCE = "rds.amazonaws.com"
 
 RDS_CREATION_EVENTS = {
@@ -216,14 +218,18 @@ def wait_until_available(
     identifier,
     retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
     retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
     expected_deletion_protection=None,
 ):
-    retry_attempts = max(int(retry_attempts), 1)
-    retry_delay_seconds = max(int(retry_delay_seconds), 0)
+    retry_delay_seconds = max(int(retry_delay_seconds), 1)
+    wait_timeout_seconds = max(int(wait_timeout_seconds), 0)
+    deadline = time.monotonic() + wait_timeout_seconds
+    attempt = 0
     last_status = None
     last_deletion_protection = None
 
-    for attempt in range(1, retry_attempts + 1):
+    while True:
+        attempt += 1
         item = describe_resource(rds, resource, identifier)
         if item is None:
             raise RDSStatusTimeoutError(
@@ -239,8 +245,12 @@ def wait_until_available(
         if last_status == "available" and deletion_protection_matches:
             return item, attempt
 
-        if attempt < retry_attempts and retry_delay_seconds:
-            time.sleep(retry_delay_seconds)
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
+
+        if retry_delay_seconds:
+            time.sleep(min(retry_delay_seconds, remaining_seconds))
 
     extra_status = ""
     if expected_deletion_protection is not None:
@@ -250,7 +260,8 @@ def wait_until_available(
 
     raise RDSStatusTimeoutError(
         f"{resource['type']} {identifier} did not become available after "
-        f"{retry_attempts} status checks. Last status: {last_status or 'unknown'}."
+        f"{wait_timeout_seconds} seconds and {attempt} status checks. "
+        f"Last status: {last_status or 'unknown'}."
         f"{extra_status}"
     )
 
@@ -260,6 +271,7 @@ def delete_finding(
     finding,
     status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
     status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    status_wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
 ):
     resource = resource_by_type(finding["resource_type"])
     identifier = finding["identifier"]
@@ -269,6 +281,7 @@ def delete_finding(
         identifier,
         retry_attempts=status_retry_attempts,
         retry_delay_seconds=status_retry_delay_seconds,
+        wait_timeout_seconds=status_wait_timeout_seconds,
     )
     action = {
         "region": finding["region"],
@@ -297,6 +310,7 @@ def delete_finding(
             identifier,
             retry_attempts=status_retry_attempts,
             retry_delay_seconds=status_retry_delay_seconds,
+            wait_timeout_seconds=status_wait_timeout_seconds,
             expected_deletion_protection=False,
         )
         action["pre_delete_status"] = item.get(resource["status_key"], "")
@@ -316,6 +330,7 @@ def delete_findings(
     findings,
     status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
     status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    status_wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
 ):
     actions = []
     errors = []
@@ -331,6 +346,7 @@ def delete_findings(
                     finding,
                     status_retry_attempts=status_retry_attempts,
                     status_retry_delay_seconds=status_retry_delay_seconds,
+                    status_wait_timeout_seconds=status_wait_timeout_seconds,
                 )
             )
         except (BotoCoreError, ClientError, RDSStatusTimeoutError) as error:
@@ -511,6 +527,7 @@ def scan_account(
     delete_outdated=False,
     status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
     status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    status_wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
 ):
     if IMPORT_ERROR is not None:
         raise RuntimeError(f"Missing required Python package: {IMPORT_ERROR.name}")
@@ -533,6 +550,7 @@ def scan_account(
             findings,
             status_retry_attempts=status_retry_attempts,
             status_retry_delay_seconds=status_retry_delay_seconds,
+            status_wait_timeout_seconds=status_wait_timeout_seconds,
         )
         delete_actions.extend(actions)
         errors.extend(delete_errors)
@@ -599,6 +617,19 @@ def lambda_handler(event, context):
     status_retry_delay_seconds = event.get(
         "status_retry_delay_seconds", DEFAULT_STATUS_RETRY_DELAY_SECONDS
     )
+    status_wait_timeout_seconds = event.get(
+        "status_wait_timeout_seconds", DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS
+    )
+    if context and hasattr(context, "get_remaining_time_in_millis"):
+        remaining_seconds = max(
+            int(context.get_remaining_time_in_millis() / 1000)
+            - LAMBDA_TIMEOUT_BUFFER_SECONDS,
+            1,
+        )
+        status_wait_timeout_seconds = min(
+            int(status_wait_timeout_seconds), remaining_seconds
+        )
+
     targets = event_targets(event)
 
     if not targets and event.get("detail"):
@@ -649,6 +680,7 @@ def lambda_handler(event, context):
                 findings,
                 status_retry_attempts=status_retry_attempts,
                 status_retry_delay_seconds=status_retry_delay_seconds,
+                status_wait_timeout_seconds=status_wait_timeout_seconds,
             )
             delete_actions.extend(actions)
             errors.extend(delete_errors)
@@ -662,6 +694,7 @@ def lambda_handler(event, context):
             "findings": findings,
             "delete_action_count": len(delete_actions),
             "delete_actions": delete_actions,
+            "status_wait_timeout_seconds": status_wait_timeout_seconds,
             "errors": errors,
         })
 
@@ -671,6 +704,7 @@ def lambda_handler(event, context):
         delete_outdated=False,
         status_retry_attempts=status_retry_attempts,
         status_retry_delay_seconds=status_retry_delay_seconds,
+        status_wait_timeout_seconds=status_wait_timeout_seconds,
     )
     result["event_ignored"] = False
     return response(result)
@@ -695,13 +729,22 @@ def parse_args():
         "--status-retry-attempts",
         type=int,
         default=DEFAULT_STATUS_RETRY_ATTEMPTS,
-        help="Number of status checks before deleting a resource.",
+        help=(
+            "Deprecated compatibility option. Status waiting is controlled by "
+            "--status-wait-timeout-seconds."
+        ),
     )
     parser.add_argument(
         "--status-retry-delay-seconds",
         type=int,
         default=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
         help="Seconds to wait between RDS status checks.",
+    )
+    parser.add_argument(
+        "--status-wait-timeout-seconds",
+        type=int,
+        default=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
+        help="Maximum seconds to wait for an RDS resource to become available.",
     )
     return parser.parse_args()
 
@@ -721,6 +764,7 @@ def main() -> int:
         delete_outdated=args.delete_outdated,
         status_retry_attempts=args.status_retry_attempts,
         status_retry_delay_seconds=args.status_retry_delay_seconds,
+        status_wait_timeout_seconds=args.status_wait_timeout_seconds,
     )
 
     if result["errors"]:

@@ -7,7 +7,7 @@ When EventBridge invokes it for an RDS create or restore API event, it checks on
 
 - Runtime: Python 3.14, Python 3.13, or Python 3.12
 - Handler: `guardrail.lambda_handler`
-- Timeout: start with 5 minutes
+- Timeout: use up to 15 minutes when deleting newly created RDS resources; creation can remain in states like `backing-up` for several minutes
 - Memory: 256 MB is usually enough
 
 ## IAM Policy
@@ -109,7 +109,7 @@ The Lambda console test event can also use a flat target:
 }
 ```
 
-Tune status retries for a manual target-only test:
+Tune status wait time for a manual target-only test:
 
 ```json
 {
@@ -120,7 +120,7 @@ Tune status retries for a manual target-only test:
       "identifier": "test-db"
     }
   ],
-  "status_retry_attempts": 20,
+  "status_wait_timeout_seconds": 840,
   "status_retry_delay_seconds": 15
 }
 ```
@@ -151,6 +151,6 @@ Use a CloudTrail-backed EventBridge rule so the Lambda receives the API event th
 
 Do not include `ModifyDBInstance` or `ModifyDBCluster` in the rule. Those scale or configuration changes can happen to existing databases, and the Lambda intentionally ignores them when they arrive.
 
-The Lambda identifies whether the new outdated resource is a DB instance or DB cluster, waits until the resource status is `available`, removes RDS deletion protection when it is enabled, waits for the resource to become `available` again, and requests deletion with final snapshots skipped. It does not delete existing snapshots.
+The Lambda identifies whether the new outdated resource is a DB instance or DB cluster, waits until the resource status is `available`, removes RDS deletion protection when it is enabled, waits for the resource to become `available` again, and requests deletion with final snapshots skipped. It does not delete existing snapshots. The default wait budget is 840 seconds, and Lambda caps that value to the current invocation's remaining time with a 20 second buffer.
 
 The Lambda returns `PASS` when no outdated targeted resource is found or when an unsupported EventBridge event is ignored, `FAIL` when a manual report-only scan finds outdated resources, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more describe or delete operations failed.
