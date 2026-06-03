@@ -233,10 +233,12 @@ def wait_until_available(
     wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
     expected_deletion_protection=None,
     allow_not_found=False,
+    acceptable_statuses=None,
 ):
     retry_delay_seconds = max(int(retry_delay_seconds), 1)
     wait_timeout_seconds = max(int(wait_timeout_seconds), 0)
     deadline = time.monotonic() + wait_timeout_seconds
+    acceptable_statuses = set(acceptable_statuses or [])
     attempt = 0
     last_status = None
     last_deletion_protection = None
@@ -259,6 +261,8 @@ def wait_until_available(
             or last_deletion_protection == expected_deletion_protection
         )
         if last_status == "available" and deletion_protection_matches:
+            return item, attempt
+        if last_status in acceptable_statuses:
             return item, attempt
 
         remaining_seconds = deadline - time.monotonic()
@@ -364,10 +368,15 @@ def delete_cluster_members(
                 retry_delay_seconds=status_retry_delay_seconds,
                 wait_timeout_seconds=status_wait_timeout_seconds,
                 allow_not_found=True,
+                acceptable_statuses={"deleting"},
             )
             member_action["status_checks"] += member_status_checks
             if member_item is None:
                 member_action["delete_wait_status"] = "not-found"
+                actions.append(member_action)
+                continue
+            if member_item.get(instance_resource["status_key"], "") == "deleting":
+                member_action["delete_wait_status"] = "deleting"
                 actions.append(member_action)
                 continue
 
@@ -387,10 +396,15 @@ def delete_cluster_members(
                     wait_timeout_seconds=status_wait_timeout_seconds,
                     expected_deletion_protection=False,
                     allow_not_found=True,
+                    acceptable_statuses={"deleting"},
                 )
                 member_action["status_checks"] += protection_status_checks
                 if member_item is None:
                     member_action["delete_wait_status"] = "not-found"
+                    actions.append(member_action)
+                    continue
+                if member_item.get(instance_resource["status_key"], "") == "deleting":
+                    member_action["delete_wait_status"] = "deleting"
                     actions.append(member_action)
                     continue
 
