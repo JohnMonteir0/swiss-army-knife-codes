@@ -117,6 +117,8 @@ RDS_RESOURCES = [
         "id_arg": "DBClusterIdentifier",
     },
 ]
+RDS_RESOURCE_BY_TYPE = {resource["type"]: resource for resource in RDS_RESOURCES}
+RDS_RESOURCE_TYPES = set(RDS_RESOURCE_BY_TYPE)
 
 
 class RDSStatusTimeoutError(RuntimeError):
@@ -124,7 +126,7 @@ class RDSStatusTimeoutError(RuntimeError):
 
 
 def resource_by_type(resource_type):
-    return next(item for item in RDS_RESOURCES if item["type"] == resource_type)
+    return RDS_RESOURCE_BY_TYPE[resource_type]
 
 
 def numbers(version):
@@ -360,7 +362,13 @@ def delete_cluster_members(
             "status_checks": 0,
         }
 
-        if member_item.get(instance_resource["status_key"], "") != "deleting":
+        member_status = member_item.get(instance_resource["status_key"], "")
+        if member_status == "deleting":
+            member_action["delete_wait_status"] = "deleting"
+            actions.append(member_action)
+            continue
+
+        if member_status != "available":
             member_item, member_status_checks = wait_until_available(
                 rds,
                 instance_resource,
@@ -380,41 +388,41 @@ def delete_cluster_members(
                 actions.append(member_action)
                 continue
 
-            if member_item.get("DeletionProtection", False):
-                getattr(rds, instance_resource["modify_api"])(
-                    **{
-                        instance_resource["id_arg"]: member_identifier,
-                        "DeletionProtection": False,
-                        "ApplyImmediately": True,
-                    }
-                )
-                member_item, protection_status_checks = wait_until_available(
-                    rds,
-                    instance_resource,
-                    member_identifier,
-                    retry_delay_seconds=status_retry_delay_seconds,
-                    wait_timeout_seconds=status_wait_timeout_seconds,
-                    expected_deletion_protection=False,
-                    allow_not_found=True,
-                    acceptable_statuses={"deleting"},
-                )
-                member_action["status_checks"] += protection_status_checks
-                if member_item is None:
-                    member_action["delete_wait_status"] = "not-found"
-                    actions.append(member_action)
-                    continue
-                if member_item.get(instance_resource["status_key"], "") == "deleting":
-                    member_action["delete_wait_status"] = "deleting"
-                    actions.append(member_action)
-                    continue
-
-            getattr(rds, instance_resource["delete_api"])(
+        if member_item.get("DeletionProtection", False):
+            getattr(rds, instance_resource["modify_api"])(
                 **{
                     instance_resource["id_arg"]: member_identifier,
-                    "SkipFinalSnapshot": True,
+                    "DeletionProtection": False,
+                    "ApplyImmediately": True,
                 }
             )
-            member_action["delete_requested"] = True
+            member_item, protection_status_checks = wait_until_available(
+                rds,
+                instance_resource,
+                member_identifier,
+                retry_delay_seconds=status_retry_delay_seconds,
+                wait_timeout_seconds=status_wait_timeout_seconds,
+                expected_deletion_protection=False,
+                allow_not_found=True,
+                acceptable_statuses={"deleting"},
+            )
+            member_action["status_checks"] += protection_status_checks
+            if member_item is None:
+                member_action["delete_wait_status"] = "not-found"
+                actions.append(member_action)
+                continue
+            if member_item.get(instance_resource["status_key"], "") == "deleting":
+                member_action["delete_wait_status"] = "deleting"
+                actions.append(member_action)
+                continue
+
+        getattr(rds, instance_resource["delete_api"])(
+            **{
+                instance_resource["id_arg"]: member_identifier,
+                "SkipFinalSnapshot": True,
+            }
+        )
+        member_action["delete_requested"] = True
 
         delete_wait_status, delete_status_checks = wait_until_status_or_gone(
             rds,
@@ -527,7 +535,8 @@ def delete_findings(
     for finding in findings:
         region = finding["region"]
         try:
-            clients.setdefault(region, session.client("rds", region_name=region))
+            if region not in clients:
+                clients[region] = session.client("rds", region_name=region)
             actions.append(
                 delete_finding(
                     clients[region],
@@ -579,7 +588,7 @@ def normalize_target(target):
     resource_type = target.get("resource_type") or target.get("resourceType")
     identifier = target.get("identifier")
 
-    if resource_type not in {resource["type"] for resource in RDS_RESOURCES}:
+    if resource_type not in RDS_RESOURCE_TYPES:
         return None
 
     if not region or not identifier:
@@ -675,12 +684,15 @@ def response(result):
 def scan_targets(session, targets):
     findings = []
     errors = []
+    clients = {}
 
     for target in targets:
         region = target["region"]
         resource = resource_by_type(target["resource_type"])
         try:
-            rds = session.client("rds", region_name=region)
+            if region not in clients:
+                clients[region] = session.client("rds", region_name=region)
+            rds = clients[region]
             item = describe_resource(rds, resource, target["identifier"])
             if item is None:
                 errors.append(
