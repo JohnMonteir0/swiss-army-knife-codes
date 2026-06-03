@@ -232,6 +232,7 @@ def wait_until_available(
     retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
     wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
     expected_deletion_protection=None,
+    allow_not_found=False,
 ):
     retry_delay_seconds = max(int(retry_delay_seconds), 1)
     wait_timeout_seconds = max(int(wait_timeout_seconds), 0)
@@ -244,6 +245,9 @@ def wait_until_available(
         attempt += 1
         item = describe_resource(rds, resource, identifier)
         if item is None:
+            if allow_not_found:
+                return None, attempt
+
             raise RDSStatusTimeoutError(
                 f"{resource['type']} {identifier} was not found while checking status."
             )
@@ -359,8 +363,13 @@ def delete_cluster_members(
                 member_identifier,
                 retry_delay_seconds=status_retry_delay_seconds,
                 wait_timeout_seconds=status_wait_timeout_seconds,
+                allow_not_found=True,
             )
             member_action["status_checks"] += member_status_checks
+            if member_item is None:
+                member_action["delete_wait_status"] = "not-found"
+                actions.append(member_action)
+                continue
 
             if member_item.get("DeletionProtection", False):
                 getattr(rds, instance_resource["modify_api"])(
@@ -377,8 +386,13 @@ def delete_cluster_members(
                     retry_delay_seconds=status_retry_delay_seconds,
                     wait_timeout_seconds=status_wait_timeout_seconds,
                     expected_deletion_protection=False,
+                    allow_not_found=True,
                 )
                 member_action["status_checks"] += protection_status_checks
+                if member_item is None:
+                    member_action["delete_wait_status"] = "not-found"
+                    actions.append(member_action)
+                    continue
 
             getattr(rds, instance_resource["delete_api"])(
                 **{
@@ -466,6 +480,15 @@ def delete_finding(
             member_action["status_checks"]
             for member_action in cluster_member_actions
         )
+        item, cluster_status_checks = wait_until_available(
+            rds,
+            resource,
+            identifier,
+            retry_delay_seconds=status_retry_delay_seconds,
+            wait_timeout_seconds=status_wait_timeout_seconds,
+        )
+        action["pre_delete_status"] = item.get(resource["status_key"], "")
+        action["status_checks"] += cluster_status_checks
 
     delete_args = {
         resource["id_arg"]: identifier,
