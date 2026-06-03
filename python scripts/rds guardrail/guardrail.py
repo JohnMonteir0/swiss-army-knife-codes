@@ -388,6 +388,16 @@ def normalize_target(target):
     }
 
 
+def has_target_input(event):
+    if not isinstance(event, dict):
+        return False
+
+    if "targets" in event or "target" in event:
+        return True
+
+    return any(key in event for key in ("identifier", "resource_type", "resourceType"))
+
+
 def eventbridge_target(event):
     detail = event.get("detail") if isinstance(event, dict) else None
     if not isinstance(detail, dict):
@@ -418,11 +428,24 @@ def eventbridge_target(event):
 def event_targets(event):
     targets = []
     explicit_targets = event.get("targets") if isinstance(event, dict) else None
+    explicit_target = event.get("target") if isinstance(event, dict) else None
     if isinstance(explicit_targets, list):
         for target in explicit_targets:
             normalized_target = normalize_target(target)
             if normalized_target:
                 targets.append(normalized_target)
+    elif isinstance(explicit_targets, dict):
+        normalized_target = normalize_target(explicit_targets)
+        if normalized_target:
+            targets.append(normalized_target)
+    elif isinstance(explicit_target, dict):
+        normalized_target = normalize_target(explicit_target)
+        if normalized_target:
+            targets.append(normalized_target)
+    else:
+        normalized_target = normalize_target(event)
+        if normalized_target:
+            targets.append(normalized_target)
 
     event_target = eventbridge_target(event)
     if event_target:
@@ -438,6 +461,11 @@ def event_targets(event):
         unique_targets.append(target)
 
     return unique_targets
+
+
+def response(result):
+    print(json.dumps(result, default=str))
+    return result
 
 
 def scan_targets(session, targets):
@@ -574,7 +602,7 @@ def lambda_handler(event, context):
     targets = event_targets(event)
 
     if not targets and event.get("detail"):
-        return {
+        return response({
             "status": "PASS",
             "event_ignored": True,
             "ignore_reason": (
@@ -588,7 +616,27 @@ def lambda_handler(event, context):
             "delete_action_count": 0,
             "delete_actions": [],
             "errors": [],
-        }
+        })
+
+    if not targets and has_target_input(event):
+        return response({
+            "status": "ERROR",
+            "event_ignored": False,
+            "target_count": 0,
+            "targets": [],
+            "finding_count": 0,
+            "findings": [],
+            "delete_action_count": 0,
+            "delete_actions": [],
+            "errors": [
+                {
+                    "error": (
+                        "Target input was provided but no valid target could be parsed. "
+                        "Use region, resource_type, and identifier for each target."
+                    )
+                }
+            ],
+        })
 
     session = boto3.Session()
 
@@ -606,7 +654,7 @@ def lambda_handler(event, context):
             errors.extend(delete_errors)
 
         status = "ERROR" if errors else "DELETE_REQUESTED" if findings else "PASS"
-        return {
+        return response({
             "status": status,
             "target_count": len(targets),
             "targets": targets,
@@ -615,7 +663,7 @@ def lambda_handler(event, context):
             "delete_action_count": len(delete_actions),
             "delete_actions": delete_actions,
             "errors": errors,
-        }
+        })
 
     result = scan_account(
         session=session,
@@ -625,7 +673,7 @@ def lambda_handler(event, context):
         status_retry_delay_seconds=status_retry_delay_seconds,
     )
     result["event_ignored"] = False
-    return result
+    return response(result)
 
 
 def parse_args():

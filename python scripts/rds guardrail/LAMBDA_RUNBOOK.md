@@ -99,6 +99,16 @@ Manually test target-only deletion:
 }
 ```
 
+The Lambda console test event can also use a flat target:
+
+```json
+{
+  "region": "us-east-1",
+  "resource_type": "DBInstance",
+  "identifier": "test-db"
+}
+```
+
 Tune status retries for a manual target-only test:
 
 ```json
