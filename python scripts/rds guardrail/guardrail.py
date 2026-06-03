@@ -205,9 +205,21 @@ def scan_region(session, region):
 
 
 def describe_resource(rds, resource, identifier):
-    response = getattr(rds, resource["api"])(
-        **{resource["id_arg"]: identifier}
-    )
+    try:
+        response = getattr(rds, resource["api"])(
+            **{resource["id_arg"]: identifier}
+        )
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code in {
+            "DBInstanceNotFound",
+            "DBInstanceNotFoundFault",
+            "DBClusterNotFound",
+            "DBClusterNotFoundFault",
+        }:
+            return None
+        raise
+
     items = response.get(resource["result_key"], [])
     return items[0] if items else None
 
@@ -266,6 +278,131 @@ def wait_until_available(
     )
 
 
+def wait_until_status_or_gone(
+    rds,
+    resource,
+    identifier,
+    target_statuses,
+    retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
+):
+    retry_delay_seconds = max(int(retry_delay_seconds), 1)
+    wait_timeout_seconds = max(int(wait_timeout_seconds), 0)
+    deadline = time.monotonic() + wait_timeout_seconds
+    attempt = 0
+    last_status = None
+
+    while True:
+        attempt += 1
+        item = describe_resource(rds, resource, identifier)
+        if item is None:
+            return "not-found", attempt
+
+        last_status = item.get(resource["status_key"], "")
+        if last_status in target_statuses:
+            return last_status, attempt
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
+
+        time.sleep(min(retry_delay_seconds, remaining_seconds))
+
+    raise RDSStatusTimeoutError(
+        f"{resource['type']} {identifier} did not reach one of "
+        f"{sorted(target_statuses)} or disappear after {wait_timeout_seconds} "
+        f"seconds and {attempt} status checks. Last status: "
+        f"{last_status or 'unknown'}."
+    )
+
+
+def delete_cluster_members(
+    rds,
+    cluster,
+    status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
+    status_wait_timeout_seconds=DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS,
+):
+    instance_resource = resource_by_type("DBInstance")
+    actions = []
+
+    for member in cluster.get("DBClusterMembers", []):
+        member_identifier = member.get("DBInstanceIdentifier")
+        if not member_identifier:
+            continue
+
+        member_item = describe_resource(rds, instance_resource, member_identifier)
+        if member_item is None:
+            actions.append(
+                {
+                    "identifier": member_identifier,
+                    "status": "NOT_FOUND",
+                    "delete_requested": False,
+                    "status_checks": 0,
+                }
+            )
+            continue
+
+        member_action = {
+            "identifier": member_identifier,
+            "pre_delete_status": member_item.get(
+                instance_resource["status_key"], ""
+            ),
+            "delete_requested": False,
+            "delete_wait_status": "",
+            "status_checks": 0,
+        }
+
+        if member_item.get(instance_resource["status_key"], "") != "deleting":
+            member_item, member_status_checks = wait_until_available(
+                rds,
+                instance_resource,
+                member_identifier,
+                retry_delay_seconds=status_retry_delay_seconds,
+                wait_timeout_seconds=status_wait_timeout_seconds,
+            )
+            member_action["status_checks"] += member_status_checks
+
+            if member_item.get("DeletionProtection", False):
+                getattr(rds, instance_resource["modify_api"])(
+                    **{
+                        instance_resource["id_arg"]: member_identifier,
+                        "DeletionProtection": False,
+                        "ApplyImmediately": True,
+                    }
+                )
+                member_item, protection_status_checks = wait_until_available(
+                    rds,
+                    instance_resource,
+                    member_identifier,
+                    retry_delay_seconds=status_retry_delay_seconds,
+                    wait_timeout_seconds=status_wait_timeout_seconds,
+                    expected_deletion_protection=False,
+                )
+                member_action["status_checks"] += protection_status_checks
+
+            getattr(rds, instance_resource["delete_api"])(
+                **{
+                    instance_resource["id_arg"]: member_identifier,
+                    "SkipFinalSnapshot": True,
+                }
+            )
+            member_action["delete_requested"] = True
+
+        delete_wait_status, delete_status_checks = wait_until_status_or_gone(
+            rds,
+            instance_resource,
+            member_identifier,
+            {"deleting"},
+            retry_delay_seconds=status_retry_delay_seconds,
+            wait_timeout_seconds=status_wait_timeout_seconds,
+        )
+        member_action["delete_wait_status"] = delete_wait_status
+        member_action["status_checks"] += delete_status_checks
+        actions.append(member_action)
+
+    return actions
+
+
 def delete_finding(
     rds,
     finding,
@@ -292,6 +429,7 @@ def delete_finding(
         "deletion_protection_removed": False,
         "final_snapshot_skipped": True,
         "snapshots_deleted": False,
+        "cluster_member_delete_actions": [],
         "status": "DELETE_REQUESTED",
     }
 
@@ -315,6 +453,19 @@ def delete_finding(
         )
         action["pre_delete_status"] = item.get(resource["status_key"], "")
         action["status_checks"] += protection_status_checks
+
+    if resource["type"] == "DBCluster":
+        cluster_member_actions = delete_cluster_members(
+            rds,
+            item,
+            status_retry_delay_seconds=status_retry_delay_seconds,
+            status_wait_timeout_seconds=status_wait_timeout_seconds,
+        )
+        action["cluster_member_delete_actions"] = cluster_member_actions
+        action["status_checks"] += sum(
+            member_action["status_checks"]
+            for member_action in cluster_member_actions
+        )
 
     delete_args = {
         resource["id_arg"]: identifier,
