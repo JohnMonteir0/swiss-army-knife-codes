@@ -1,7 +1,7 @@
 # RDS Guardrail Lambda Runbook
 
 This Lambda scans RDS DB instances and DB clusters for engine versions below the policy in `guardrail.py`.
-When it runs in Lambda, it automatically deletes outdated resources without requiring an event flag.
+When EventBridge invokes it for an RDS create or restore API event, it checks only the resource from that event and deletes it only when it violates the version policy. RDS resources that existed before the event are not deleted. Modify and scale events are ignored.
 
 ## Lambda Settings
 
@@ -71,7 +71,7 @@ aws lambda update-function-code \
 
 ## Test Event
 
-Scan specific regions:
+Report outdated resources in specific regions without deleting them:
 
 ```json
 {
@@ -79,30 +79,68 @@ Scan specific regions:
 }
 ```
 
-Scan all enabled commercial regions:
+Report outdated resources in all enabled commercial regions without deleting them:
 
 ```json
 {}
 ```
 
-Delete outdated resources in specific regions:
+Manually test target-only deletion:
 
 ```json
 {
-  "regions": ["us-east-1", "us-west-2"]
+  "targets": [
+    {
+      "region": "us-east-1",
+      "resource_type": "DBInstance",
+      "identifier": "test-db"
+    }
+  ]
 }
 ```
 
-Tune status retries when EventBridge invokes the Lambda:
+Tune status retries for a manual target-only test:
 
 ```json
 {
-  "regions": ["us-east-1", "us-west-2"],
+  "targets": [
+    {
+      "region": "us-east-1",
+      "resource_type": "DBInstance",
+      "identifier": "test-db"
+    }
+  ],
   "status_retry_attempts": 20,
   "status_retry_delay_seconds": 15
 }
 ```
 
-The Lambda identifies whether each outdated resource is a DB instance or DB cluster, waits until the resource status is `available`, removes RDS deletion protection when it is enabled, waits for the resource to become `available` again, and requests deletion with final snapshots skipped. It does not delete existing snapshots.
+## EventBridge Rule
 
-The Lambda returns `PASS` when no outdated resources are found, `FAIL` when outdated resources are found, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more regions or delete operations failed.
+Use a CloudTrail-backed EventBridge rule so the Lambda receives the API event that created or restored the resource:
+
+```json
+{
+  "source": ["aws.rds"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventSource": ["rds.amazonaws.com"],
+    "eventName": [
+      "CreateDBInstance",
+      "CreateDBInstanceReadReplica",
+      "RestoreDBInstanceFromDBSnapshot",
+      "RestoreDBInstanceFromS3",
+      "RestoreDBInstanceToPointInTime",
+      "CreateDBCluster",
+      "RestoreDBClusterFromSnapshot",
+      "RestoreDBClusterToPointInTime"
+    ]
+  }
+}
+```
+
+Do not include `ModifyDBInstance` or `ModifyDBCluster` in the rule. Those scale or configuration changes can happen to existing databases, and the Lambda intentionally ignores them when they arrive.
+
+The Lambda identifies whether the new outdated resource is a DB instance or DB cluster, waits until the resource status is `available`, removes RDS deletion protection when it is enabled, waits for the resource to become `available` again, and requests deletion with final snapshots skipped. It does not delete existing snapshots.
+
+The Lambda returns `PASS` when no outdated targeted resource is found or when an unsupported EventBridge event is ignored, `FAIL` when a manual report-only scan finds outdated resources, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more describe or delete operations failed.

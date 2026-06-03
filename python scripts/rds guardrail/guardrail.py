@@ -23,6 +23,7 @@ Examples:
 Lambda event example:
   {"regions": ["us-east-1", "us-west-2"]}
   {"regions": ["us-east-1"], "status_retry_attempts": 20}
+  {"targets": [{"region": "us-east-1", "resource_type": "DBInstance", "identifier": "test-db"}]}
 """
 
 import argparse
@@ -66,6 +67,31 @@ POLICY = {
 
 DEFAULT_STATUS_RETRY_ATTEMPTS = 20
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = 15
+RDS_EVENT_SOURCE = "rds.amazonaws.com"
+
+RDS_CREATION_EVENTS = {
+    "CreateDBInstance": "DBInstance",
+    "CreateDBInstanceReadReplica": "DBInstance",
+    "RestoreDBInstanceFromDBSnapshot": "DBInstance",
+    "RestoreDBInstanceFromS3": "DBInstance",
+    "RestoreDBInstanceToPointInTime": "DBInstance",
+    "CreateDBCluster": "DBCluster",
+    "RestoreDBClusterFromSnapshot": "DBCluster",
+    "RestoreDBClusterToPointInTime": "DBCluster",
+}
+
+EVENT_IDENTIFIER_KEYS = {
+    "DBInstance": {
+        "DBInstanceIdentifier",
+        "dBInstanceIdentifier",
+        "dbInstanceIdentifier",
+    },
+    "DBCluster": {
+        "DBClusterIdentifier",
+        "dBClusterIdentifier",
+        "dbClusterIdentifier",
+    },
+}
 
 RDS_RESOURCES = [
     {
@@ -93,6 +119,10 @@ RDS_RESOURCES = [
 
 class RDSStatusTimeoutError(RuntimeError):
     pass
+
+
+def resource_by_type(resource_type):
+    return next(item for item in RDS_RESOURCES if item["type"] == resource_type)
 
 
 def numbers(version):
@@ -140,30 +170,34 @@ def paginate(client, operation, result_key):
         yield from page.get(result_key, [])
 
 
+def finding_from_item(region, resource, item):
+    engine = item.get("Engine", "")
+    engine_version = item.get("EngineVersion", "")
+    failed_policy = policy_result(engine, engine_version)
+    if not failed_policy:
+        return None
+
+    return {
+        "region": region,
+        "resource_type": resource["type"],
+        "identifier": item.get(resource["id_key"], ""),
+        "status": item.get(resource["status_key"], ""),
+        "engine": engine,
+        "engine_version": engine_version,
+        "deletion_protection": item.get("DeletionProtection", False),
+        **failed_policy,
+    }
+
+
 def scan_region(session, region):
     rds = session.client("rds", region_name=region)
     findings = []
 
     for resource in RDS_RESOURCES:
         for item in paginate(rds, resource["api"], resource["result_key"]):
-            engine = item.get("Engine", "")
-            engine_version = item.get("EngineVersion", "")
-            failed_policy = policy_result(engine, engine_version)
-            if not failed_policy:
-                continue
-
-            findings.append(
-                {
-                    "region": region,
-                    "resource_type": resource["type"],
-                    "identifier": item.get(resource["id_key"], ""),
-                    "status": item.get(resource["status_key"], ""),
-                    "engine": engine,
-                    "engine_version": engine_version,
-                    "deletion_protection": item.get("DeletionProtection", False),
-                    **failed_policy,
-                }
-            )
+            finding = finding_from_item(region, resource, item)
+            if finding:
+                findings.append(finding)
 
     return findings
 
@@ -227,9 +261,7 @@ def delete_finding(
     status_retry_attempts=DEFAULT_STATUS_RETRY_ATTEMPTS,
     status_retry_delay_seconds=DEFAULT_STATUS_RETRY_DELAY_SECONDS,
 ):
-    resource = next(
-        item for item in RDS_RESOURCES if item["type"] == finding["resource_type"]
-    )
+    resource = resource_by_type(finding["resource_type"])
     identifier = finding["identifier"]
     item, status_checks = wait_until_available(
         rds,
@@ -312,6 +344,137 @@ def delete_findings(
             )
 
     return actions, errors
+
+
+def find_nested_value(data, candidate_keys):
+    if isinstance(data, dict):
+        for key in candidate_keys:
+            value = data.get(key)
+            if value:
+                return value
+
+        for value in data.values():
+            nested_value = find_nested_value(value, candidate_keys)
+            if nested_value:
+                return nested_value
+
+    if isinstance(data, list):
+        for item in data:
+            nested_value = find_nested_value(item, candidate_keys)
+            if nested_value:
+                return nested_value
+
+    return None
+
+
+def normalize_target(target):
+    if not isinstance(target, dict):
+        return None
+
+    region = target.get("region")
+    resource_type = target.get("resource_type") or target.get("resourceType")
+    identifier = target.get("identifier")
+
+    if resource_type not in {resource["type"] for resource in RDS_RESOURCES}:
+        return None
+
+    if not region or not identifier:
+        return None
+
+    return {
+        "region": region,
+        "resource_type": resource_type,
+        "identifier": identifier,
+    }
+
+
+def eventbridge_target(event):
+    detail = event.get("detail") if isinstance(event, dict) else None
+    if not isinstance(detail, dict):
+        return None
+
+    if detail.get("eventSource") != RDS_EVENT_SOURCE:
+        return None
+
+    event_name = detail.get("eventName")
+    resource_type = RDS_CREATION_EVENTS.get(event_name)
+    if not resource_type:
+        return None
+
+    identifier = find_nested_value(
+        [detail.get("responseElements"), detail.get("requestParameters")],
+        EVENT_IDENTIFIER_KEYS[resource_type],
+    )
+    region = detail.get("awsRegion") or event.get("region")
+    return normalize_target(
+        {
+            "region": region,
+            "resource_type": resource_type,
+            "identifier": identifier,
+        }
+    )
+
+
+def event_targets(event):
+    targets = []
+    explicit_targets = event.get("targets") if isinstance(event, dict) else None
+    if isinstance(explicit_targets, list):
+        for target in explicit_targets:
+            normalized_target = normalize_target(target)
+            if normalized_target:
+                targets.append(normalized_target)
+
+    event_target = eventbridge_target(event)
+    if event_target:
+        targets.append(event_target)
+
+    seen = set()
+    unique_targets = []
+    for target in targets:
+        key = (target["region"], target["resource_type"], target["identifier"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_targets.append(target)
+
+    return unique_targets
+
+
+def scan_targets(session, targets):
+    findings = []
+    errors = []
+
+    for target in targets:
+        region = target["region"]
+        resource = resource_by_type(target["resource_type"])
+        try:
+            rds = session.client("rds", region_name=region)
+            item = describe_resource(rds, resource, target["identifier"])
+            if item is None:
+                errors.append(
+                    {
+                        "region": region,
+                        "resource_type": target["resource_type"],
+                        "identifier": target["identifier"],
+                        "error": "Resource was not found.",
+                    }
+                )
+                continue
+
+            finding = finding_from_item(region, resource, item)
+            if finding:
+                findings.append(finding)
+        except (BotoCoreError, ClientError) as error:
+            errors.append(
+                {
+                    "region": region,
+                    "resource_type": target["resource_type"],
+                    "identifier": target["identifier"],
+                    "error": str(error),
+                }
+            )
+
+    return findings, errors
 
 
 def scan_account(
@@ -399,17 +562,70 @@ def print_table(findings):
 
 def lambda_handler(event, context):
     event = event or {}
-    regions = event.get("regions")
-    return scan_account(
-        regions=regions,
-        delete_outdated=True,
-        status_retry_attempts=event.get(
-            "status_retry_attempts", DEFAULT_STATUS_RETRY_ATTEMPTS
-        ),
-        status_retry_delay_seconds=event.get(
-            "status_retry_delay_seconds", DEFAULT_STATUS_RETRY_DELAY_SECONDS
-        ),
+    if IMPORT_ERROR is not None:
+        raise RuntimeError(f"Missing required Python package: {IMPORT_ERROR.name}")
+
+    status_retry_attempts = event.get(
+        "status_retry_attempts", DEFAULT_STATUS_RETRY_ATTEMPTS
     )
+    status_retry_delay_seconds = event.get(
+        "status_retry_delay_seconds", DEFAULT_STATUS_RETRY_DELAY_SECONDS
+    )
+    targets = event_targets(event)
+
+    if not targets and event.get("detail"):
+        return {
+            "status": "PASS",
+            "event_ignored": True,
+            "ignore_reason": (
+                "Lambda deletes only RDS create or restore EventBridge events. "
+                "Existing resources and modify/scale events are ignored."
+            ),
+            "target_count": 0,
+            "targets": [],
+            "finding_count": 0,
+            "findings": [],
+            "delete_action_count": 0,
+            "delete_actions": [],
+            "errors": [],
+        }
+
+    session = boto3.Session()
+
+    if targets:
+        findings, errors = scan_targets(session, targets)
+        delete_actions = []
+        if findings:
+            actions, delete_errors = delete_findings(
+                session,
+                findings,
+                status_retry_attempts=status_retry_attempts,
+                status_retry_delay_seconds=status_retry_delay_seconds,
+            )
+            delete_actions.extend(actions)
+            errors.extend(delete_errors)
+
+        status = "ERROR" if errors else "DELETE_REQUESTED" if findings else "PASS"
+        return {
+            "status": status,
+            "target_count": len(targets),
+            "targets": targets,
+            "finding_count": len(findings),
+            "findings": findings,
+            "delete_action_count": len(delete_actions),
+            "delete_actions": delete_actions,
+            "errors": errors,
+        }
+
+    result = scan_account(
+        session=session,
+        regions=event.get("regions"),
+        delete_outdated=False,
+        status_retry_attempts=status_retry_attempts,
+        status_retry_delay_seconds=status_retry_delay_seconds,
+    )
+    result["event_ignored"] = False
+    return result
 
 
 def parse_args():
