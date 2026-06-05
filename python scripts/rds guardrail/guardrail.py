@@ -226,6 +226,16 @@ def describe_resource(rds, resource, identifier):
     return items[0] if items else None
 
 
+def is_resource_not_found_error(error):
+    error_code = error.response.get("Error", {}).get("Code", "")
+    return error_code in {
+        "DBInstanceNotFound",
+        "DBInstanceNotFoundFault",
+        "DBClusterNotFound",
+        "DBClusterNotFoundFault",
+    }
+
+
 def wait_until_available(
     rds,
     resource,
@@ -455,7 +465,23 @@ def delete_finding(
         retry_attempts=status_retry_attempts,
         retry_delay_seconds=status_retry_delay_seconds,
         wait_timeout_seconds=status_wait_timeout_seconds,
+        allow_not_found=True,
+        acceptable_statuses={"deleting"},
     )
+    if item is None:
+        return {
+            "region": finding["region"],
+            "resource_type": finding["resource_type"],
+            "identifier": identifier,
+            "pre_delete_status": finding.get("status", ""),
+            "status_checks": status_checks,
+            "deletion_protection_removed": False,
+            "final_snapshot_skipped": True,
+            "snapshots_deleted": False,
+            "cluster_member_delete_actions": [],
+            "status": "ALREADY_DELETED",
+        }
+
     action = {
         "region": finding["region"],
         "resource_type": finding["resource_type"],
@@ -468,6 +494,10 @@ def delete_finding(
         "cluster_member_delete_actions": [],
         "status": "DELETE_REQUESTED",
     }
+
+    if item.get(resource["status_key"], "") == "deleting":
+        action["status"] = "DELETE_IN_PROGRESS"
+        return action
 
     if item.get("DeletionProtection", False):
         getattr(rds, resource["modify_api"])(
@@ -486,9 +516,19 @@ def delete_finding(
             retry_delay_seconds=status_retry_delay_seconds,
             wait_timeout_seconds=status_wait_timeout_seconds,
             expected_deletion_protection=False,
+            allow_not_found=True,
+            acceptable_statuses={"deleting"},
         )
+        if item is None:
+            action["status"] = "ALREADY_DELETED"
+            action["status_checks"] += protection_status_checks
+            return action
+
         action["pre_delete_status"] = item.get(resource["status_key"], "")
         action["status_checks"] += protection_status_checks
+        if item.get(resource["status_key"], "") == "deleting":
+            action["status"] = "DELETE_IN_PROGRESS"
+            return action
 
     if resource["type"] == "DBCluster":
         cluster_member_actions = delete_cluster_members(
@@ -508,16 +548,33 @@ def delete_finding(
             identifier,
             retry_delay_seconds=status_retry_delay_seconds,
             wait_timeout_seconds=status_wait_timeout_seconds,
+            allow_not_found=True,
+            acceptable_statuses={"deleting"},
         )
+        if item is None:
+            action["status"] = "ALREADY_DELETED"
+            action["status_checks"] += cluster_status_checks
+            return action
+
         action["pre_delete_status"] = item.get(resource["status_key"], "")
         action["status_checks"] += cluster_status_checks
+        if item.get(resource["status_key"], "") == "deleting":
+            action["status"] = "DELETE_IN_PROGRESS"
+            return action
 
     delete_args = {
         resource["id_arg"]: identifier,
         "SkipFinalSnapshot": True,
     }
 
-    getattr(rds, resource["delete_api"])(**delete_args)
+    try:
+        getattr(rds, resource["delete_api"])(**delete_args)
+    except ClientError as error:
+        if is_resource_not_found_error(error):
+            action["status"] = "ALREADY_DELETED"
+            return action
+        raise
+
     return action
 
 
@@ -695,14 +752,6 @@ def scan_targets(session, targets):
             rds = clients[region]
             item = describe_resource(rds, resource, target["identifier"])
             if item is None:
-                errors.append(
-                    {
-                        "region": region,
-                        "resource_type": target["resource_type"],
-                        "identifier": target["identifier"],
-                        "error": "Resource was not found.",
-                    }
-                )
                 continue
 
             finding = finding_from_item(region, resource, item)
