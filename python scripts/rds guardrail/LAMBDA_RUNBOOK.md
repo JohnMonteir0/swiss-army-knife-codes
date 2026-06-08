@@ -3,6 +3,23 @@
 This Lambda scans RDS DB instances and DB clusters for engine versions below the policy in `guardrail.py`.
 When EventBridge invokes it for an RDS create or restore API event, it checks only the resource from that event and deletes it only when it violates the version policy. RDS resources that existed before the event are not deleted. Modify and scale events are ignored.
 
+## Version Policy Exceptions
+
+Add DB instance or DB cluster identifiers to `POLICY_EXCEPTIONS` in `guardrail.py` when a resource must be allowed to use a version below the configured minimum:
+
+```python
+POLICY_EXCEPTIONS = {
+    "DBInstance": {
+        "legacy-instance",
+    },
+    "DBCluster": {
+        "legacy-cluster",
+    },
+}
+```
+
+Identifier matching is case-insensitive. An exempt resource is omitted from findings and is not deleted by an EventBridge-triggered creation or restore check. Keep instance and cluster exceptions in their corresponding sets.
+
 ## Lambda Settings
 
 - Runtime: Python 3.14, Python 3.13, or Python 3.12

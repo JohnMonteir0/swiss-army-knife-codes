@@ -65,6 +65,17 @@ POLICY = {
     },
 }
 
+# Resources listed here are exempt from the version policy. Use the exact RDS
+# identifier; matching is case-insensitive.
+POLICY_EXCEPTIONS = {
+    "DBInstance": {
+        # "legacy-instance",
+    },
+    "DBCluster": {
+        # "legacy-cluster",
+    },
+}
+
 DEFAULT_STATUS_RETRY_ATTEMPTS = 20
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = 15
 DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS = 840
@@ -162,6 +173,14 @@ def policy_result(engine, engine_version):
     }
 
 
+def is_policy_exception(resource_type, identifier):
+    normalized_identifier = (identifier or "").strip().lower()
+    return normalized_identifier in {
+        exception_identifier.strip().lower()
+        for exception_identifier in POLICY_EXCEPTIONS.get(resource_type, set())
+    }
+
+
 def enabled_regions(session):
     ec2 = session.client("ec2", region_name="us-east-1")
     response = ec2.describe_regions(AllRegions=False)
@@ -175,6 +194,10 @@ def paginate(client, operation, result_key):
 
 
 def finding_from_item(region, resource, item):
+    identifier = item.get(resource["id_key"], "")
+    if is_policy_exception(resource["type"], identifier):
+        return None
+
     engine = item.get("Engine", "")
     engine_version = item.get("EngineVersion", "")
     failed_policy = policy_result(engine, engine_version)
@@ -184,7 +207,7 @@ def finding_from_item(region, resource, item):
     return {
         "region": region,
         "resource_type": resource["type"],
-        "identifier": item.get(resource["id_key"], ""),
+        "identifier": identifier,
         "status": item.get(resource["status_key"], ""),
         "engine": engine,
         "engine_version": engine_version,
