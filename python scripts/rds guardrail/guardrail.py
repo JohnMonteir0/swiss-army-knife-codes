@@ -28,6 +28,7 @@ Lambda event example:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -46,38 +47,16 @@ else:
     IMPORT_ERROR = None
 
 
-# DevOps-friendly guardrail configuration. Change only this block when policy changes.
-POLICY = {
-    "mysql": {
-        "minimum": (8, 4, 7),
-        "required": "8.4.7",
-        "message": "MySQL version is below 8.4.7",
-    },
-    "aurora-mysql": {
-        "minimum": (3, 10, 3),
-        "required": "8.0.mysql_aurora.3.10.3",
-        "message": "Aurora MySQL version is below 8.0.mysql_aurora.3.10.3",
-    },
-    "postgres": {
-        "minimum_major": 17,
-        "required": "17",
-        "message": "PostgreSQL major version is below 17",
-    },
-}
+# Loaded from S3 before a scan. Keeping these as module-level values avoids
+# threading configuration through every policy evaluation and deletion path.
+POLICY = {}
+POLICY_EXCEPTIONS = {"DBInstance": set(), "DBCluster": set()}
 
-# Resources listed here are exempt from the version policy. Entries can be an
-# identifier string (all accounts) or an (account_id, identifier) tuple.
-# Identifier matching is case-insensitive.
-POLICY_EXCEPTIONS = {
-    "DBInstance": {
-        # "legacy-instance",
-        # ("123456789012", "account-specific-instance"),
-    },
-    "DBCluster": {
-        # "legacy-cluster",
-        # ("123456789012", "account-specific-cluster"),
-    },
-}
+POLICY_BUCKET_ENV = "POLICY_BUCKET"
+POLICY_KEY_ENV = "POLICY_KEY"
+POLICY_EXCEPTIONS_KEY_ENV = "POLICY_EXCEPTIONS_KEY"
+POLICY_BUCKET_REGION_ENV = "POLICY_BUCKET_REGION"
+POLICY_CONFIG_ROLE_ARN_ENV = "POLICY_CONFIG_ROLE_ARN"
 
 DEFAULT_STATUS_RETRY_ATTEMPTS = 20
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = 15
@@ -141,8 +120,155 @@ class RDSStatusTimeoutError(RuntimeError):
     pass
 
 
+class PolicyConfigurationError(RuntimeError):
+    pass
+
+
 def resource_by_type(resource_type):
     return RDS_RESOURCE_BY_TYPE[resource_type]
+
+
+def policy_s3_client(session, region_name=None, role_arn=None):
+    if not role_arn:
+        return session.client("s3", region_name=region_name)
+
+    sts = session.client("sts")
+    credentials = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName="rds-guardrail-policy-reader",
+    )["Credentials"]
+    assumed_session = boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+    )
+    return assumed_session.client("s3", region_name=region_name)
+
+
+def read_s3_json(s3, bucket, key):
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        return json.loads(body)
+    except (KeyError, TypeError, ValueError) as error:
+        raise PolicyConfigurationError(
+            f"Invalid JSON policy configuration in s3://{bucket}/{key}: {error}"
+        ) from error
+
+
+def normalize_policy(raw_policy):
+    if not isinstance(raw_policy, dict) or not raw_policy:
+        raise PolicyConfigurationError("Policy JSON must be a non-empty object.")
+
+    policy = {}
+    for engine, raw_rule in raw_policy.items():
+        if not isinstance(engine, str) or not isinstance(raw_rule, dict):
+            raise PolicyConfigurationError(
+                "Each policy entry must map an engine name to an object."
+            )
+        rule = dict(raw_rule)
+        if "minimum" in rule:
+            minimum = rule["minimum"]
+            if not isinstance(minimum, list) or not all(
+                isinstance(part, int) for part in minimum
+            ):
+                raise PolicyConfigurationError(
+                    f"Policy minimum for {engine} must be an array of integers."
+                )
+            rule["minimum"] = tuple(minimum)
+        elif not isinstance(rule.get("minimum_major"), int):
+            raise PolicyConfigurationError(
+                f"Policy for {engine} requires minimum or minimum_major."
+            )
+
+        if not isinstance(rule.get("required"), str) or not isinstance(
+            rule.get("message"), str
+        ):
+            raise PolicyConfigurationError(
+                f"Policy for {engine} requires string required and message values."
+            )
+        policy[engine.lower()] = rule
+
+    return policy
+
+
+def normalize_policy_exceptions(raw_exceptions):
+    if not isinstance(raw_exceptions, dict):
+        raise PolicyConfigurationError("Policy exceptions JSON must be an object.")
+
+    exceptions = {"DBInstance": set(), "DBCluster": set()}
+    unknown_types = set(raw_exceptions) - RDS_RESOURCE_TYPES
+    if unknown_types:
+        raise PolicyConfigurationError(
+            f"Unknown policy exception resource types: {sorted(unknown_types)}"
+        )
+
+    for resource_type, entries in raw_exceptions.items():
+        if not isinstance(entries, list):
+            raise PolicyConfigurationError(
+                f"Policy exceptions for {resource_type} must be an array."
+            )
+        for entry in entries:
+            if isinstance(entry, str):
+                exceptions[resource_type].add(entry)
+            elif (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and all(isinstance(value, str) for value in entry)
+            ):
+                exceptions[resource_type].add(tuple(entry))
+            else:
+                raise PolicyConfigurationError(
+                    f"Invalid policy exception for {resource_type}: {entry!r}"
+                )
+
+    return exceptions
+
+
+def load_policy_configuration(
+    session,
+    bucket=None,
+    policy_key=None,
+    policy_exceptions_key=None,
+    bucket_region=None,
+    role_arn=None,
+):
+    bucket = bucket or os.environ.get(POLICY_BUCKET_ENV)
+    policy_key = policy_key or os.environ.get(POLICY_KEY_ENV)
+    policy_exceptions_key = policy_exceptions_key or os.environ.get(
+        POLICY_EXCEPTIONS_KEY_ENV
+    )
+    bucket_region = bucket_region or os.environ.get(POLICY_BUCKET_REGION_ENV)
+    role_arn = role_arn or os.environ.get(POLICY_CONFIG_ROLE_ARN_ENV)
+    missing = [
+        name
+        for name, value in (
+            (POLICY_BUCKET_ENV, bucket),
+            (POLICY_KEY_ENV, policy_key),
+            (POLICY_EXCEPTIONS_KEY_ENV, policy_exceptions_key),
+        )
+        if not value
+    ]
+    if missing:
+        raise PolicyConfigurationError(
+            f"Missing policy configuration settings: {', '.join(missing)}"
+        )
+
+    s3 = policy_s3_client(session, bucket_region, role_arn)
+    loaded_policy = normalize_policy(read_s3_json(s3, bucket, policy_key))
+    loaded_exceptions = normalize_policy_exceptions(
+        read_s3_json(s3, bucket, policy_exceptions_key)
+    )
+
+    POLICY.clear()
+    POLICY.update(loaded_policy)
+    POLICY_EXCEPTIONS.clear()
+    POLICY_EXCEPTIONS.update(loaded_exceptions)
+    return {
+        "bucket": bucket,
+        "policy_key": policy_key,
+        "policy_exceptions_key": policy_exceptions_key,
+        "assumed_role": bool(role_arn),
+    }
 
 
 def numbers(version):
@@ -1019,6 +1145,22 @@ def lambda_handler(event, context):
         })
 
     session = boto3.Session()
+    try:
+        policy_configuration = load_policy_configuration(session)
+    except (BotoCoreError, ClientError, PolicyConfigurationError) as error:
+        return response({
+            "status": "ERROR",
+            "event_ignored": False,
+            "target_count": len(targets),
+            "targets": targets,
+            "finding_count": 0,
+            "findings": [],
+            "exception_count": 0,
+            "exceptions": [],
+            "delete_action_count": 0,
+            "delete_actions": [],
+            "errors": [{"error": f"Unable to load policy configuration: {error}"}],
+        })
 
     if targets:
         findings, exceptions, errors = scan_targets(session, targets)
@@ -1045,6 +1187,7 @@ def lambda_handler(event, context):
             "exceptions": exceptions,
             "delete_action_count": len(delete_actions),
             "delete_actions": delete_actions,
+            "policy_configuration": policy_configuration,
             "status_wait_timeout_seconds": status_wait_timeout_seconds,
             "errors": errors,
         })
@@ -1058,6 +1201,7 @@ def lambda_handler(event, context):
         status_wait_timeout_seconds=status_wait_timeout_seconds,
     )
     result["event_ignored"] = False
+    result["policy_configuration"] = policy_configuration
     return response(result)
 
 
@@ -1068,6 +1212,32 @@ def parse_args():
     parser.add_argument("--profile", help="AWS profile name to use.")
     parser.add_argument("--regions", nargs="+", help="AWS regions to scan.")
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    parser.add_argument(
+        "--policy-bucket",
+        help=f"S3 policy bucket. Defaults to ${POLICY_BUCKET_ENV}.",
+    )
+    parser.add_argument(
+        "--policy-key",
+        help=f"S3 version policy object key. Defaults to ${POLICY_KEY_ENV}.",
+    )
+    parser.add_argument(
+        "--policy-exceptions-key",
+        help=(
+            "S3 policy exceptions object key. Defaults to "
+            f"${POLICY_EXCEPTIONS_KEY_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--policy-bucket-region",
+        help=f"S3 bucket region. Defaults to ${POLICY_BUCKET_REGION_ENV}.",
+    )
+    parser.add_argument(
+        "--policy-config-role-arn",
+        help=(
+            "Optional cross-account role to assume before reading S3. "
+            f"Defaults to ${POLICY_CONFIG_ROLE_ARN_ENV}."
+        ),
+    )
     parser.add_argument(
         "--delete-outdated",
         action="store_true",
@@ -1109,6 +1279,19 @@ def main() -> int:
         return 2
 
     session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
+    try:
+        policy_configuration = load_policy_configuration(
+            session,
+            bucket=args.policy_bucket,
+            policy_key=args.policy_key,
+            policy_exceptions_key=args.policy_exceptions_key,
+            bucket_region=args.policy_bucket_region,
+            role_arn=args.policy_config_role_arn,
+        )
+    except (BotoCoreError, ClientError, PolicyConfigurationError) as error:
+        print(f"Unable to load policy configuration: {error}", file=sys.stderr)
+        return 2
+
     result = scan_account(
         session=session,
         regions=args.regions,
@@ -1117,6 +1300,7 @@ def main() -> int:
         status_retry_delay_seconds=args.status_retry_delay_seconds,
         status_wait_timeout_seconds=args.status_wait_timeout_seconds,
     )
+    result["policy_configuration"] = policy_configuration
 
     if result["errors"]:
         print(json.dumps(result["errors"], indent=2), file=sys.stderr)

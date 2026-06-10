@@ -1,0 +1,10 @@
+{
+  "DBInstance": [
+    "legacy-instance",
+    ["123456789012", "account-specific-instance"]
+  ],
+  "DBCluster": [
+    "legacy-cluster",
+    ["123456789012", "account-specific-cluster"]
+  ]
+}

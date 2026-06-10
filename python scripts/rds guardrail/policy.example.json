@@ -1,0 +1,17 @@
+{
+  "mysql": {
+    "minimum": [8, 4, 7],
+    "required": "8.4.7",
+    "message": "MySQL version is below 8.4.7"
+  },
+  "aurora-mysql": {
+    "minimum": [3, 10, 3],
+    "required": "8.0.mysql_aurora.3.10.3",
+    "message": "Aurora MySQL version is below 8.0.mysql_aurora.3.10.3"
+  },
+  "postgres": {
+    "minimum_major": 17,
+    "required": "17",
+    "message": "PostgreSQL major version is below 17"
+  }
+}

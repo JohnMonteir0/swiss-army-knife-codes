@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -11,12 +12,35 @@ SPEC.loader.exec_module(guardrail)
 
 class PolicyExceptionTests(unittest.TestCase):
     def setUp(self):
+        self.original_policy = dict(guardrail.POLICY)
         self.original_exceptions = {
             resource_type: set(identifiers)
             for resource_type, identifiers in guardrail.POLICY_EXCEPTIONS.items()
         }
+        guardrail.POLICY.clear()
+        guardrail.POLICY.update({
+            "mysql": {
+                "minimum": (8, 4, 7),
+                "required": "8.4.7",
+                "message": "MySQL version is below 8.4.7",
+            },
+            "aurora-mysql": {
+                "minimum": (3, 10, 3),
+                "required": "8.0.mysql_aurora.3.10.3",
+                "message": (
+                    "Aurora MySQL version is below 8.0.mysql_aurora.3.10.3"
+                ),
+            },
+            "postgres": {
+                "minimum_major": 17,
+                "required": "17",
+                "message": "PostgreSQL major version is below 17",
+            },
+        })
 
     def tearDown(self):
+        guardrail.POLICY.clear()
+        guardrail.POLICY.update(self.original_policy)
         guardrail.POLICY_EXCEPTIONS.clear()
         guardrail.POLICY_EXCEPTIONS.update(self.original_exceptions)
 
@@ -103,6 +127,114 @@ class PolicyExceptionTests(unittest.TestCase):
         self.assertIsNone(
             guardrail.policy_exception_from_item("us-east-1", resource, item)
         )
+
+
+class PolicyConfigurationTests(unittest.TestCase):
+    def test_normalizes_json_policy_and_exceptions(self):
+        policy = guardrail.normalize_policy({
+            "mysql": {
+                "minimum": [8, 4, 7],
+                "required": "8.4.7",
+                "message": "MySQL version is below 8.4.7",
+            },
+            "postgres": {
+                "minimum_major": 17,
+                "required": "17",
+                "message": "PostgreSQL major version is below 17",
+            },
+        })
+        exceptions = guardrail.normalize_policy_exceptions({
+            "DBInstance": [
+                "global-instance",
+                ["123456789012", "account-instance"],
+            ],
+            "DBCluster": [],
+        })
+
+        self.assertEqual(policy["mysql"]["minimum"], (8, 4, 7))
+        self.assertIn("global-instance", exceptions["DBInstance"])
+        self.assertIn(
+            ("123456789012", "account-instance"),
+            exceptions["DBInstance"],
+        )
+
+    def test_rejects_invalid_exception_entry(self):
+        with self.assertRaises(guardrail.PolicyConfigurationError):
+            guardrail.normalize_policy_exceptions({
+                "DBInstance": [{"account_id": "123456789012"}]
+            })
+
+    def test_loads_both_policy_objects_from_s3(self):
+        class Body:
+            def __init__(self, value):
+                self.value = value
+
+            def read(self):
+                return json.dumps(self.value).encode("utf-8")
+
+        class S3:
+            def __init__(self, objects):
+                self.objects = objects
+                self.requests = []
+
+            def get_object(self, Bucket, Key):
+                self.requests.append((Bucket, Key))
+                return {"Body": Body(self.objects[Key])}
+
+        class Session:
+            def __init__(self, s3):
+                self.s3 = s3
+
+            def client(self, service_name, region_name=None):
+                self.service_name = service_name
+                self.region_name = region_name
+                return self.s3
+
+        s3 = S3({
+            "policy.json": {
+                "mysql": {
+                    "minimum": [8, 4, 7],
+                    "required": "8.4.7",
+                    "message": "MySQL version is below 8.4.7",
+                }
+            },
+            "exceptions.json": {
+                "DBInstance": [["123456789012", "account-instance"]],
+                "DBCluster": [],
+            },
+        })
+        session = Session(s3)
+        original_policy = dict(guardrail.POLICY)
+        original_exceptions = {
+            key: set(value)
+            for key, value in guardrail.POLICY_EXCEPTIONS.items()
+        }
+        try:
+            result = guardrail.load_policy_configuration(
+                session,
+                bucket="policy-bucket",
+                policy_key="policy.json",
+                policy_exceptions_key="exceptions.json",
+                bucket_region="us-east-1",
+            )
+
+            self.assertEqual(session.service_name, "s3")
+            self.assertEqual(session.region_name, "us-east-1")
+            self.assertEqual(s3.requests, [
+                ("policy-bucket", "policy.json"),
+                ("policy-bucket", "exceptions.json"),
+            ])
+            self.assertEqual(guardrail.POLICY["mysql"]["minimum"], (8, 4, 7))
+            self.assertIn(
+                ("123456789012", "account-instance"),
+                guardrail.POLICY_EXCEPTIONS["DBInstance"],
+            )
+            self.assertFalse(result["assumed_role"])
+        finally:
+            guardrail.POLICY.clear()
+            guardrail.POLICY.update(original_policy)
+            guardrail.POLICY_EXCEPTIONS.clear()
+            guardrail.POLICY_EXCEPTIONS.update(original_exceptions)
 
     def test_compliant_resource_is_not_reported_as_an_exception(self):
         guardrail.POLICY_EXCEPTIONS["DBInstance"] = {"current-instance"}
