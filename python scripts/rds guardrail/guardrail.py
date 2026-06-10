@@ -52,12 +52,6 @@ else:
 POLICY = {}
 POLICY_EXCEPTIONS = {"DBInstance": set(), "DBCluster": set()}
 
-POLICY_BUCKET_ENV = "POLICY_BUCKET"
-POLICY_KEY_ENV = "POLICY_KEY"
-POLICY_EXCEPTIONS_KEY_ENV = "POLICY_EXCEPTIONS_KEY"
-POLICY_BUCKET_REGION_ENV = "POLICY_BUCKET_REGION"
-POLICY_CONFIG_ROLE_ARN_ENV = "POLICY_CONFIG_ROLE_ARN"
-
 DEFAULT_STATUS_RETRY_ATTEMPTS = 20
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = 15
 DEFAULT_STATUS_WAIT_TIMEOUT_SECONDS = 840
@@ -232,19 +226,19 @@ def load_policy_configuration(
     bucket_region=None,
     role_arn=None,
 ):
-    bucket = bucket or os.environ.get(POLICY_BUCKET_ENV)
-    policy_key = policy_key or os.environ.get(POLICY_KEY_ENV)
+    bucket = bucket or os.environ.get("POLICY_BUCKET")
+    policy_key = policy_key or os.environ.get("POLICY_KEY")
     policy_exceptions_key = policy_exceptions_key or os.environ.get(
-        POLICY_EXCEPTIONS_KEY_ENV
+        "POLICY_EXCEPTIONS_KEY"
     )
-    bucket_region = bucket_region or os.environ.get(POLICY_BUCKET_REGION_ENV)
-    role_arn = role_arn or os.environ.get(POLICY_CONFIG_ROLE_ARN_ENV)
+    bucket_region = bucket_region or os.environ.get("POLICY_BUCKET_REGION")
+    role_arn = role_arn or os.environ.get("POLICY_CONFIG_ROLE_ARN")
     missing = [
         name
         for name, value in (
-            (POLICY_BUCKET_ENV, bucket),
-            (POLICY_KEY_ENV, policy_key),
-            (POLICY_EXCEPTIONS_KEY_ENV, policy_exceptions_key),
+            ("POLICY_BUCKET", bucket),
+            ("POLICY_KEY", policy_key),
+            ("POLICY_EXCEPTIONS_KEY", policy_exceptions_key),
         )
         if not value
     ]
@@ -1277,28 +1271,28 @@ def parse_args():
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     parser.add_argument(
         "--policy-bucket",
-        help=f"S3 policy bucket. Defaults to ${POLICY_BUCKET_ENV}.",
+        help="S3 policy bucket. Defaults to $POLICY_BUCKET.",
     )
     parser.add_argument(
         "--policy-key",
-        help=f"S3 version policy object key. Defaults to ${POLICY_KEY_ENV}.",
+        help="S3 version policy object key. Defaults to $POLICY_KEY.",
     )
     parser.add_argument(
         "--policy-exceptions-key",
         help=(
             "S3 policy exceptions object key. Defaults to "
-            f"${POLICY_EXCEPTIONS_KEY_ENV}."
+            "$POLICY_EXCEPTIONS_KEY."
         ),
     )
     parser.add_argument(
         "--policy-bucket-region",
-        help=f"S3 bucket region. Defaults to ${POLICY_BUCKET_REGION_ENV}.",
+        help="S3 bucket region. Defaults to $POLICY_BUCKET_REGION.",
     )
     parser.add_argument(
         "--policy-config-role-arn",
         help=(
             "Optional cross-account role to assume before reading S3. "
-            f"Defaults to ${POLICY_CONFIG_ROLE_ARN_ENV}."
+            "Defaults to $POLICY_CONFIG_ROLE_ARN."
         ),
     )
     parser.add_argument(
