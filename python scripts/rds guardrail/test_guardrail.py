@@ -1,7 +1,9 @@
 import importlib.util
 import json
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).with_name("guardrail.py")
@@ -316,6 +318,46 @@ class PolicyConfigurationTests(unittest.TestCase):
             guardrail.POLICY.update(original_policy)
             guardrail.POLICY_EXCEPTIONS.clear()
             guardrail.POLICY_EXCEPTIONS.update(original_exceptions)
+
+    def test_loads_policy_location_from_environment_variables(self):
+        class Session:
+            def client(self, service_name, region_name=None):
+                self.service_name = service_name
+                self.region_name = region_name
+                return object()
+
+        session = Session()
+        policy = {
+            "mysql": {
+                "minimum": [8, 4, 7],
+                "required": "8.4.7",
+                "message": "MySQL version is below 8.4.7",
+            }
+        }
+        exceptions = {"DBInstance": [], "DBCluster": []}
+        with patch.dict(os.environ, {
+            "POLICY_BUCKET": "policy-bucket",
+            "POLICY_KEY": "policy.json",
+            "POLICY_EXCEPTIONS_KEY": "policy-exceptions.json",
+            "POLICY_BUCKET_REGION": "us-east-1",
+        }, clear=True), patch.object(
+            guardrail,
+            "read_s3_json",
+            side_effect=[policy, exceptions],
+        ) as read_s3_json:
+            result = guardrail.load_policy_configuration(session)
+
+        self.assertEqual(session.service_name, "s3")
+        self.assertEqual(session.region_name, "us-east-1")
+        self.assertEqual(read_s3_json.call_args_list[0].args[1:], (
+            "policy-bucket",
+            "policy.json",
+        ))
+        self.assertEqual(read_s3_json.call_args_list[1].args[1:], (
+            "policy-bucket",
+            "policy-exceptions.json",
+        ))
+        self.assertEqual(result["bucket"], "policy-bucket")
 
     def test_compliant_resource_is_not_reported_as_an_exception(self):
         guardrail.POLICY_EXCEPTIONS["DBInstance"] = {"current-instance"}
