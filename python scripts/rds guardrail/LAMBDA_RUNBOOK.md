@@ -1,28 +1,28 @@
-# RDS Guardrail Lambda Runbook
+# Runbook da Lambda de Guardrail do RDS
 
-This Lambda scans RDS DB instances and DB clusters for engine versions below the policy in `guardrail.py`.
-When EventBridge invokes it for an RDS create or restore API event, it checks only the resource from that event and deletes it only when it violates the version policy. RDS resources that existed before the event are not deleted. Modify and scale events are ignored.
+Esta Lambda verifica instancias de banco de dados e clusters do RDS que utilizam versoes de engine abaixo da politica definida em `guardrail.py`.
+Quando o EventBridge a invoca para um evento de API de criacao ou restauracao do RDS, ela verifica somente o recurso desse evento e o exclui apenas quando ele viola a politica de versao. Recursos do RDS que ja existiam antes do evento nao sao excluidos. Eventos de modificacao e escalabilidade sao ignorados.
 
-## S3 Policy Configuration
+## Configuracao das Politicas no S3
 
-The Lambda loads both policies from S3 before every scan. It does not contain fallback policy values, so a missing, inaccessible, or invalid object returns `ERROR` and prevents deletion.
+A Lambda carrega as duas politicas do S3 antes de cada verificacao. Ela nao possui valores de politica alternativos no codigo. Portanto, um objeto ausente, inacessivel ou invalido retorna `ERROR` e impede a exclusao.
 
-Upload JSON based on these repository templates:
+Envie arquivos JSON baseados nestes modelos do repositorio:
 
-- `policy.example.json`: engine minimum versions and messages
-- `policy-exceptions.example.json`: global and account-specific resource exceptions
+- `policy.example.json`: versoes minimas e mensagens para cada engine
+- `policy-exceptions.example.json`: excecoes de recursos globais e especificas por conta
 
-Configure these Lambda environment variables:
+Configure estas variaveis de ambiente na Lambda:
 
-| Variable | Required | Description |
+| Variavel | Obrigatoria | Descricao |
 | --- | --- | --- |
-| `POLICY_BUCKET` | Yes | Bucket containing both JSON objects |
-| `POLICY_KEY` | Yes | Version policy object key, for example `rds/policy.json` |
-| `POLICY_EXCEPTIONS_KEY` | Yes | Exceptions object key, for example `rds/policy-exceptions.json` |
-| `POLICY_BUCKET_REGION` | No | Bucket region; recommended when it differs from the Lambda region |
-| `POLICY_CONFIG_ROLE_ARN` | No | Cross-account role to assume before reading the objects |
+| `POLICY_BUCKET` | Sim | Bucket que contem os dois objetos JSON |
+| `POLICY_KEY` | Sim | Chave do objeto da politica de versao, por exemplo `rds/policy.json` |
+| `POLICY_EXCEPTIONS_KEY` | Sim | Chave do objeto de excecoes, por exemplo `rds/policy-exceptions.json` |
+| `POLICY_BUCKET_REGION` | Nao | Regiao do bucket; recomendada quando for diferente da regiao da Lambda |
+| `POLICY_CONFIG_ROLE_ARN` | Nao | Role entre contas que deve ser assumida antes da leitura dos objetos |
 
-Exception identifier strings apply in every account. A two-value JSON array applies only when both the account ID and identifier match:
+Identificadores de excecao definidos como strings sao aplicados a todas as contas. Um array JSON com dois valores e aplicado somente quando o ID da conta e o identificador correspondem:
 
 ```json
 {
@@ -34,26 +34,26 @@ Exception identifier strings apply in every account. A two-value JSON array appl
 }
 ```
 
-Identifier matching is case-insensitive; account IDs must match exactly. An exempt outdated resource is omitted from findings, is not deleted, and appears under `exceptions` with `result` set to `EXCEPTION`.
+A comparacao dos identificadores nao diferencia maiusculas de minusculas; os IDs das contas devem corresponder exatamente. Um recurso desatualizado, mas isento, e omitido dos achados, nao e excluido e aparece em `exceptions` com `result` definido como `EXCEPTION`.
 
-Exceptions are inherited through RDS relationships, without depending on generated naming conventions:
+As excecoes sao herdadas por meio dos relacionamentos do RDS, sem depender das convencoes de nomes gerados:
 
-- Every DB instance whose `DBClusterIdentifier` points to an exempt cluster inherits that cluster exception. This protects existing members and members added later through scaling.
-- A read replica whose `ReadReplicaSourceDBInstanceIdentifier` points to an exempt DB instance inherits the source exception, including cross-region replica ARNs.
-- Account-scoped exceptions are inherited only when the parent cluster or source instance account ID also matches.
+- Toda instancia de banco de dados cujo `DBClusterIdentifier` aponta para um cluster isento herda a excecao desse cluster. Isso protege os membros existentes e os membros adicionados posteriormente por escalabilidade.
+- Uma replica de leitura cujo `ReadReplicaSourceDBInstanceIdentifier` aponta para uma instancia de banco de dados isenta herda a excecao da instancia de origem, inclusive quando o valor e um ARN de replica entre regioes.
+- Excecoes especificas por conta sao herdadas somente quando o ID da conta do cluster pai ou da instancia de origem tambem corresponde.
 
-The output includes `exception_match.match_type` as `DIRECT`, `PARENT_CLUSTER`, or `SOURCE_INSTANCE`, plus the identifier that supplied the exception.
+A saida inclui `exception_match.match_type` como `DIRECT`, `PARENT_CLUSTER` ou `SOURCE_INSTANCE`, alem do identificador que forneceu a excecao.
 
-## Lambda Settings
+## Configuracoes da Lambda
 
-- Runtime: Python 3.14, Python 3.13, or Python 3.12
+- Runtime: Python 3.14, Python 3.13 ou Python 3.12
 - Handler: `guardrail.lambda_handler`
-- Timeout: use up to 15 minutes when deleting newly created RDS resources; creation can remain in states like `backing-up` for several minutes
-- Memory: 256 MB is usually enough
+- Timeout: use ate 15 minutos ao excluir recursos do RDS recem-criados; a criacao pode permanecer por varios minutos em estados como `backing-up`
+- Memoria: 256 MB normalmente sao suficientes
 
-## IAM Policy
+## Politica do IAM
 
-Attach this policy to the Lambda execution role:
+Anexe esta politica a role de execucao da Lambda:
 
 ```json
 {
@@ -93,7 +93,7 @@ Attach this policy to the Lambda execution role:
 }
 ```
 
-For direct cross-account access, also add this policy to the bucket in the policy account:
+Para acesso direto entre contas, adicione tambem esta politica ao bucket da conta que armazena as politicas:
 
 ```json
 {
@@ -115,11 +115,11 @@ For direct cross-account access, also add this policy to the bucket in the polic
 }
 ```
 
-Alternatively, set `POLICY_CONFIG_ROLE_ARN` to a role in the policy account. Allow the Lambda role to call `sts:AssumeRole`, configure that role's trust policy for the Lambda role, and grant the assumed role `s3:GetObject` on both objects. If the objects use a customer-managed KMS key, also grant `kms:Decrypt` in IAM and the KMS key policy.
+Como alternativa, defina `POLICY_CONFIG_ROLE_ARN` com uma role da conta que armazena as politicas. Permita que a role da Lambda execute `sts:AssumeRole`, configure a politica de confianca da role de destino para aceitar a role da Lambda e conceda a role assumida a permissao `s3:GetObject` nos dois objetos. Se os objetos usarem uma chave KMS gerenciada pelo cliente, conceda tambem `kms:Decrypt` no IAM e na politica da chave KMS.
 
-## Zip And Deploy
+## Compactacao e Implantacao
 
-From this directory:
+A partir deste diretorio:
 
 ```bash
 zip rds-guardrail.zip guardrail.py
@@ -134,7 +134,7 @@ aws lambda create-function \
   --zip-file fileb://rds-guardrail.zip
 ```
 
-For an existing Lambda:
+Para uma Lambda existente:
 
 ```bash
 zip rds-guardrail.zip guardrail.py
@@ -143,7 +143,7 @@ aws lambda update-function-code \
   --zip-file fileb://rds-guardrail.zip
 ```
 
-Update environment variables separately when needed:
+Atualize as variaveis de ambiente separadamente quando necessario:
 
 ```bash
 aws lambda update-function-configuration \
@@ -151,9 +151,9 @@ aws lambda update-function-configuration \
   --environment 'Variables={POLICY_BUCKET=<policy-bucket>,POLICY_KEY=rds/policy.json,POLICY_EXCEPTIONS_KEY=rds/policy-exceptions.json,POLICY_BUCKET_REGION=us-east-1}'
 ```
 
-## Test Event
+## Evento de Teste
 
-Report outdated resources in specific regions without deleting them:
+Relate recursos desatualizados em regioes especificas sem exclui-los:
 
 ```json
 {
@@ -161,13 +161,13 @@ Report outdated resources in specific regions without deleting them:
 }
 ```
 
-Report outdated resources in all enabled commercial regions without deleting them:
+Relate recursos desatualizados em todas as regioes comerciais habilitadas sem exclui-los:
 
 ```json
 {}
 ```
 
-Manually test target-only deletion:
+Teste manualmente a exclusao somente dos recursos de destino:
 
 ```json
 {
@@ -181,7 +181,7 @@ Manually test target-only deletion:
 }
 ```
 
-The Lambda console test event can also use a flat target:
+O evento de teste do console da Lambda tambem pode usar um destino sem a lista `targets`:
 
 ```json
 {
@@ -191,7 +191,7 @@ The Lambda console test event can also use a flat target:
 }
 ```
 
-Tune status wait time for a manual target-only test:
+Ajuste o tempo de espera do status em um teste manual de um recurso de destino:
 
 ```json
 {
@@ -207,9 +207,9 @@ Tune status wait time for a manual target-only test:
 }
 ```
 
-## EventBridge Rule
+## Regra do EventBridge
 
-Use a CloudTrail-backed EventBridge rule so the Lambda receives the API event that created or restored the resource:
+Use uma regra do EventBridge baseada no CloudTrail para que a Lambda receba o evento de API que criou ou restaurou o recurso:
 
 ```json
 {
@@ -231,8 +231,8 @@ Use a CloudTrail-backed EventBridge rule so the Lambda receives the API event th
 }
 ```
 
-Do not include `ModifyDBInstance` or `ModifyDBCluster` in the rule. Those scale or configuration changes can happen to existing databases, and the Lambda intentionally ignores them when they arrive.
+Nao inclua `ModifyDBInstance` ou `ModifyDBCluster` na regra. Essas alteracoes de escalabilidade ou configuracao podem ocorrer em bancos de dados existentes, e a Lambda as ignora intencionalmente quando sao recebidas.
 
-The Lambda identifies whether the new outdated resource is a DB instance or DB cluster, waits until the resource status is `available`, removes RDS deletion protection when it is enabled, waits for the resource to become `available` again, and requests deletion with final snapshots skipped. If a concurrent Lambda invocation already deleted the resource or deletion is already in progress, the invocation finishes without reporting an error. For DB clusters, it first deletes writer/reader member instances and waits until they are `deleting` or gone before deleting the cluster. It does not delete existing snapshots. The default wait budget is 840 seconds, and Lambda caps that value to the current invocation's remaining time with a 20 second buffer.
+A Lambda identifica se o novo recurso desatualizado e uma instancia de banco de dados ou um cluster, aguarda ate que o status seja `available`, remove a protecao contra exclusao do RDS quando ela esta habilitada, aguarda novamente o status `available` e solicita a exclusao sem criar snapshots finais. Se outra invocacao simultanea da Lambda ja tiver excluido o recurso ou se a exclusao ja estiver em andamento, a invocacao termina sem relatar erro. Para clusters de banco de dados, ela primeiro exclui as instancias membros de escrita e leitura e aguarda ate que estejam no estado `deleting` ou nao sejam mais encontradas antes de excluir o cluster. Ela nao exclui snapshots existentes. O tempo de espera padrao e de 840 segundos, e a Lambda limita esse valor ao tempo restante da invocacao, mantendo uma margem de 20 segundos.
 
-The Lambda returns `PASS` when no outdated targeted resource is found, when an outdated resource matches a policy exception, or when an unsupported EventBridge event is ignored. It returns `FAIL` when a manual report-only scan finds outdated resources, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more describe or delete operations failed.
+A Lambda retorna `PASS` quando nenhum recurso de destino desatualizado e encontrado, quando um recurso desatualizado corresponde a uma excecao da politica ou quando um evento nao suportado do EventBridge e ignorado. Ela retorna `FAIL` quando uma verificacao manual, sem exclusao, encontra recursos desatualizados; `DELETE_REQUESTED` quando a exclusao e solicitada com sucesso; e `ERROR` quando uma ou mais operacoes de descricao ou exclusao falham.
