@@ -36,6 +36,14 @@ Exception identifier strings apply in every account. A two-value JSON array appl
 
 Identifier matching is case-insensitive; account IDs must match exactly. An exempt outdated resource is omitted from findings, is not deleted, and appears under `exceptions` with `result` set to `EXCEPTION`.
 
+Exceptions are inherited through RDS relationships, without depending on generated naming conventions:
+
+- Every DB instance whose `DBClusterIdentifier` points to an exempt cluster inherits that cluster exception. This protects existing members and members added later through scaling.
+- A read replica whose `ReadReplicaSourceDBInstanceIdentifier` points to an exempt DB instance inherits the source exception, including cross-region replica ARNs.
+- Account-scoped exceptions are inherited only when the parent cluster or source instance account ID also matches.
+
+The output includes `exception_match.match_type` as `DIRECT`, `PARENT_CLUSTER`, or `SOURCE_INSTANCE`, plus the identifier that supplied the exception.
+
 ## Lambda Settings
 
 - Runtime: Python 3.14, Python 3.13, or Python 3.12

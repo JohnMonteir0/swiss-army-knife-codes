@@ -331,15 +331,66 @@ def is_policy_exception(resource_type, identifier, account_id=""):
     return False
 
 
+def rds_reference_identifier(reference):
+    reference = str(reference or "").strip()
+    if not reference.startswith("arn:"):
+        return reference
+
+    parts = reference.split(":", 5)
+    if len(parts) != 6:
+        return reference
+    return parts[5].split(":", 1)[-1]
+
+
+def policy_exception_match(resource, item):
+    identifier = item.get(resource["id_key"], "")
+    account_id = account_id_from_arn(item.get(resource["arn_key"], ""))
+    if is_policy_exception(resource["type"], identifier, account_id):
+        return {
+            "match_type": "DIRECT",
+            "resource_type": resource["type"],
+            "identifier": identifier,
+            "account_id": account_id,
+        }
+
+    if resource["type"] != "DBInstance":
+        return None
+
+    cluster_identifier = item.get("DBClusterIdentifier", "")
+    if cluster_identifier and is_policy_exception(
+        "DBCluster", cluster_identifier, account_id
+    ):
+        return {
+            "match_type": "PARENT_CLUSTER",
+            "resource_type": "DBCluster",
+            "identifier": cluster_identifier,
+            "account_id": account_id,
+        }
+
+    source_reference = item.get("ReadReplicaSourceDBInstanceIdentifier", "")
+    source_identifier = rds_reference_identifier(source_reference)
+    source_account_id = account_id_from_arn(source_reference) or account_id
+    if source_identifier and is_policy_exception(
+        "DBInstance", source_identifier, source_account_id
+    ):
+        return {
+            "match_type": "SOURCE_INSTANCE",
+            "resource_type": "DBInstance",
+            "identifier": source_identifier,
+            "account_id": source_account_id,
+        }
+
+    return None
+
+
 def policy_exception_from_item(region, resource, item):
     identifier = item.get(resource["id_key"], "")
     account_id = account_id_from_arn(item.get(resource["arn_key"], ""))
     engine = item.get("Engine", "")
     engine_version = item.get("EngineVersion", "")
     failed_policy = policy_result(engine, engine_version)
-    if not failed_policy or not is_policy_exception(
-        resource["type"], identifier, account_id
-    ):
+    exception_match = policy_exception_match(resource, item)
+    if not failed_policy or not exception_match:
         return None
 
     return {
@@ -352,7 +403,20 @@ def policy_exception_from_item(region, resource, item):
         "engine_version": engine_version,
         "required_version": failed_policy["required_version"],
         "result": "EXCEPTION",
-        "reason": "Resource matched a configured policy exception",
+        "reason": (
+            "Resource matched a configured policy exception"
+            if exception_match["match_type"] == "DIRECT"
+            else (
+                "Resource inherited the policy exception from parent cluster "
+                f"{exception_match['identifier']}"
+                if exception_match["match_type"] == "PARENT_CLUSTER"
+                else (
+                    "Resource inherited the policy exception from source instance "
+                    f"{exception_match['identifier']}"
+                )
+            )
+        ),
+        "exception_match": exception_match,
     }
 
 
@@ -370,8 +434,7 @@ def paginate(client, operation, result_key):
 
 def finding_from_item(region, resource, item):
     identifier = item.get(resource["id_key"], "")
-    account_id = account_id_from_arn(item.get(resource["arn_key"], ""))
-    if is_policy_exception(resource["type"], identifier, account_id):
+    if policy_exception_match(resource, item):
         return None
 
     engine = item.get("Engine", "")

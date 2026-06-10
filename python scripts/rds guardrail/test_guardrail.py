@@ -128,6 +128,87 @@ class PolicyExceptionTests(unittest.TestCase):
             guardrail.policy_exception_from_item("us-east-1", resource, item)
         )
 
+    def test_cluster_member_inherits_parent_cluster_exception(self):
+        guardrail.POLICY_EXCEPTIONS["DBCluster"] = {
+            ("123456789012", "cluster-guardrail")
+        }
+        resource = guardrail.resource_by_type("DBInstance")
+        item = {
+            "DBInstanceIdentifier": "cluster-guardrail-instance-1",
+            "DBInstanceArn": (
+                "arn:aws:rds:us-east-1:123456789012:db:"
+                "cluster-guardrail-instance-1"
+            ),
+            "DBClusterIdentifier": "cluster-guardrail",
+            "DBInstanceStatus": "available",
+            "Engine": "aurora-mysql",
+            "EngineVersion": "8.0.mysql_aurora.3.08.2",
+        }
+
+        exception = guardrail.policy_exception_from_item(
+            "us-east-1", resource, item
+        )
+
+        self.assertIsNone(guardrail.finding_from_item("us-east-1", resource, item))
+        self.assertEqual(
+            exception["exception_match"]["match_type"], "PARENT_CLUSTER"
+        )
+        self.assertEqual(
+            exception["exception_match"]["identifier"], "cluster-guardrail"
+        )
+
+    def test_cluster_member_does_not_inherit_exception_from_another_account(self):
+        guardrail.POLICY_EXCEPTIONS["DBCluster"] = {
+            ("123456789012", "cluster-guardrail")
+        }
+        resource = guardrail.resource_by_type("DBInstance")
+        item = {
+            "DBInstanceIdentifier": "cluster-guardrail-instance-1",
+            "DBInstanceArn": (
+                "arn:aws:rds:us-east-1:999999999999:db:"
+                "cluster-guardrail-instance-1"
+            ),
+            "DBClusterIdentifier": "cluster-guardrail",
+            "DBInstanceStatus": "available",
+            "Engine": "aurora-mysql",
+            "EngineVersion": "8.0.mysql_aurora.3.08.2",
+        }
+
+        self.assertIsNotNone(
+            guardrail.finding_from_item("us-east-1", resource, item)
+        )
+
+    def test_read_replica_inherits_source_instance_exception(self):
+        guardrail.POLICY_EXCEPTIONS["DBInstance"] = {
+            ("123456789012", "primary-guardrail")
+        }
+        resource = guardrail.resource_by_type("DBInstance")
+        item = {
+            "DBInstanceIdentifier": "primary-guardrail-replica",
+            "DBInstanceArn": (
+                "arn:aws:rds:us-west-2:123456789012:db:"
+                "primary-guardrail-replica"
+            ),
+            "ReadReplicaSourceDBInstanceIdentifier": (
+                "arn:aws:rds:us-east-1:123456789012:db:primary-guardrail"
+            ),
+            "DBInstanceStatus": "available",
+            "Engine": "mysql",
+            "EngineVersion": "5.7.44",
+        }
+
+        exception = guardrail.policy_exception_from_item(
+            "us-west-2", resource, item
+        )
+
+        self.assertIsNone(guardrail.finding_from_item("us-west-2", resource, item))
+        self.assertEqual(
+            exception["exception_match"]["match_type"], "SOURCE_INSTANCE"
+        )
+        self.assertEqual(
+            exception["exception_match"]["identifier"], "primary-guardrail"
+        )
+
 
 class PolicyConfigurationTests(unittest.TestCase):
     def test_normalizes_json_policy_and_exceptions(self):
