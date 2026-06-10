@@ -5,20 +5,22 @@ When EventBridge invokes it for an RDS create or restore API event, it checks on
 
 ## Version Policy Exceptions
 
-Add DB instance or DB cluster identifiers to `POLICY_EXCEPTIONS` in `guardrail.py` when a resource must be allowed to use a version below the configured minimum:
+Add DB instance or DB cluster identifiers to `POLICY_EXCEPTIONS` in `guardrail.py` when a resource must be allowed to use a version below the configured minimum. Use a string to exempt that identifier in every account, or an `(account_id, identifier)` tuple to exempt it only in one account:
 
 ```python
 POLICY_EXCEPTIONS = {
     "DBInstance": {
         "legacy-instance",
+        ("123456789012", "account-specific-instance"),
     },
     "DBCluster": {
         "legacy-cluster",
+        ("123456789012", "account-specific-cluster"),
     },
 }
 ```
 
-Identifier matching is case-insensitive. An exempt resource is omitted from findings and is not deleted by an EventBridge-triggered creation or restore check. Keep instance and cluster exceptions in their corresponding sets.
+Identifier matching is case-insensitive; account IDs must match exactly. An exempt outdated resource is omitted from findings, is not deleted by an EventBridge-triggered creation or restore check, and appears in the output under `exceptions` with `result` set to `EXCEPTION`. Keep instance and cluster exceptions in their corresponding sets.
 
 ## Lambda Settings
 
@@ -170,4 +172,4 @@ Do not include `ModifyDBInstance` or `ModifyDBCluster` in the rule. Those scale 
 
 The Lambda identifies whether the new outdated resource is a DB instance or DB cluster, waits until the resource status is `available`, removes RDS deletion protection when it is enabled, waits for the resource to become `available` again, and requests deletion with final snapshots skipped. If a concurrent Lambda invocation already deleted the resource or deletion is already in progress, the invocation finishes without reporting an error. For DB clusters, it first deletes writer/reader member instances and waits until they are `deleting` or gone before deleting the cluster. It does not delete existing snapshots. The default wait budget is 840 seconds, and Lambda caps that value to the current invocation's remaining time with a 20 second buffer.
 
-The Lambda returns `PASS` when no outdated targeted resource is found or when an unsupported EventBridge event is ignored, `FAIL` when a manual report-only scan finds outdated resources, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more describe or delete operations failed.
+The Lambda returns `PASS` when no outdated targeted resource is found, when an outdated resource matches a policy exception, or when an unsupported EventBridge event is ignored. It returns `FAIL` when a manual report-only scan finds outdated resources, `DELETE_REQUESTED` when deletion was requested successfully, and `ERROR` when one or more describe or delete operations failed.

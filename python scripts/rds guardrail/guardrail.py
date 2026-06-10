@@ -65,14 +65,17 @@ POLICY = {
     },
 }
 
-# Resources listed here are exempt from the version policy. Use the exact RDS
-# identifier; matching is case-insensitive.
+# Resources listed here are exempt from the version policy. Entries can be an
+# identifier string (all accounts) or an (account_id, identifier) tuple.
+# Identifier matching is case-insensitive.
 POLICY_EXCEPTIONS = {
     "DBInstance": {
         # "legacy-instance",
+        # ("123456789012", "account-specific-instance"),
     },
     "DBCluster": {
         # "legacy-cluster",
+        # ("123456789012", "account-specific-cluster"),
     },
 }
 
@@ -112,6 +115,7 @@ RDS_RESOURCES = [
         "result_key": "DBInstances",
         "type": "DBInstance",
         "id_key": "DBInstanceIdentifier",
+        "arn_key": "DBInstanceArn",
         "status_key": "DBInstanceStatus",
         "delete_api": "delete_db_instance",
         "modify_api": "modify_db_instance",
@@ -122,6 +126,7 @@ RDS_RESOURCES = [
         "result_key": "DBClusters",
         "type": "DBCluster",
         "id_key": "DBClusterIdentifier",
+        "arn_key": "DBClusterArn",
         "status_key": "Status",
         "delete_api": "delete_db_cluster",
         "modify_api": "modify_db_cluster",
@@ -173,11 +178,55 @@ def policy_result(engine, engine_version):
     }
 
 
-def is_policy_exception(resource_type, identifier):
+def account_id_from_arn(arn):
+    parts = (arn or "").split(":", 5)
+    return parts[4] if len(parts) == 6 else ""
+
+
+def is_policy_exception(resource_type, identifier, account_id=""):
     normalized_identifier = (identifier or "").strip().lower()
-    return normalized_identifier in {
-        exception_identifier.strip().lower()
-        for exception_identifier in POLICY_EXCEPTIONS.get(resource_type, set())
+    normalized_account_id = str(account_id or "").strip()
+
+    for exception in POLICY_EXCEPTIONS.get(resource_type, set()):
+        if isinstance(exception, str):
+            if exception.strip().lower() == normalized_identifier:
+                return True
+            continue
+
+        if isinstance(exception, (tuple, list)) and len(exception) == 2:
+            exception_account_id, exception_identifier = exception
+            if (
+                str(exception_account_id).strip() == normalized_account_id
+                and str(exception_identifier).strip().lower()
+                == normalized_identifier
+            ):
+                return True
+
+    return False
+
+
+def policy_exception_from_item(region, resource, item):
+    identifier = item.get(resource["id_key"], "")
+    account_id = account_id_from_arn(item.get(resource["arn_key"], ""))
+    engine = item.get("Engine", "")
+    engine_version = item.get("EngineVersion", "")
+    failed_policy = policy_result(engine, engine_version)
+    if not failed_policy or not is_policy_exception(
+        resource["type"], identifier, account_id
+    ):
+        return None
+
+    return {
+        "region": region,
+        "account_id": account_id,
+        "resource_type": resource["type"],
+        "identifier": identifier,
+        "status": item.get(resource["status_key"], ""),
+        "engine": engine,
+        "engine_version": engine_version,
+        "required_version": failed_policy["required_version"],
+        "result": "EXCEPTION",
+        "reason": "Resource matched a configured policy exception",
     }
 
 
@@ -195,7 +244,8 @@ def paginate(client, operation, result_key):
 
 def finding_from_item(region, resource, item):
     identifier = item.get(resource["id_key"], "")
-    if is_policy_exception(resource["type"], identifier):
+    account_id = account_id_from_arn(item.get(resource["arn_key"], ""))
+    if is_policy_exception(resource["type"], identifier, account_id):
         return None
 
     engine = item.get("Engine", "")
@@ -219,14 +269,19 @@ def finding_from_item(region, resource, item):
 def scan_region(session, region):
     rds = session.client("rds", region_name=region)
     findings = []
+    exceptions = []
 
     for resource in RDS_RESOURCES:
         for item in paginate(rds, resource["api"], resource["result_key"]):
+            exception = policy_exception_from_item(region, resource, item)
+            if exception:
+                exceptions.append(exception)
+                continue
             finding = finding_from_item(region, resource, item)
             if finding:
                 findings.append(finding)
 
-    return findings
+    return findings, exceptions
 
 
 def describe_resource(rds, resource, identifier):
@@ -763,6 +818,7 @@ def response(result):
 
 def scan_targets(session, targets):
     findings = []
+    exceptions = []
     errors = []
     clients = {}
 
@@ -775,6 +831,11 @@ def scan_targets(session, targets):
             rds = clients[region]
             item = describe_resource(rds, resource, target["identifier"])
             if item is None:
+                continue
+
+            exception = policy_exception_from_item(region, resource, item)
+            if exception:
+                exceptions.append(exception)
                 continue
 
             finding = finding_from_item(region, resource, item)
@@ -790,7 +851,7 @@ def scan_targets(session, targets):
                 }
             )
 
-    return findings, errors
+    return findings, exceptions, errors
 
 
 def scan_account(
@@ -807,11 +868,14 @@ def scan_account(
     session = session or boto3.Session()
     regions = regions or enabled_regions(session)
     findings = []
+    exceptions = []
     errors = []
 
     for region in regions:
         try:
-            findings.extend(scan_region(session, region))
+            region_findings, region_exceptions = scan_region(session, region)
+            findings.extend(region_findings)
+            exceptions.extend(region_exceptions)
         except (BotoCoreError, ClientError) as error:
             errors.append({"region": region, "error": str(error)})
 
@@ -835,14 +899,21 @@ def scan_account(
         "status": status,
         "finding_count": len(findings),
         "findings": findings,
+        "exception_count": len(exceptions),
+        "exceptions": exceptions,
         "delete_action_count": len(delete_actions),
         "delete_actions": delete_actions,
         "errors": errors,
     }
 
 
-def print_table(findings):
-    if not findings:
+def print_table(findings, exceptions=None):
+    exceptions = exceptions or []
+    results = [
+        {**finding, "result": "FAIL"}
+        for finding in findings
+    ] + exceptions
+    if not results:
         print("No outdated RDS resources found.")
         return
 
@@ -853,6 +924,7 @@ def print_table(findings):
         "Engine",
         "Current",
         "Required",
+        "Result",
         "Reason",
     ]
     rows = [
@@ -863,9 +935,10 @@ def print_table(findings):
             finding["engine"],
             finding["engine_version"],
             finding["required_version"],
+            finding["result"],
             finding["reason"],
         ]
-        for finding in findings
+        for finding in results
     ]
     widths = [
         max(len(str(row[index])) for row in [headers, *rows])
@@ -916,6 +989,8 @@ def lambda_handler(event, context):
             "targets": [],
             "finding_count": 0,
             "findings": [],
+            "exception_count": 0,
+            "exceptions": [],
             "delete_action_count": 0,
             "delete_actions": [],
             "errors": [],
@@ -929,6 +1004,8 @@ def lambda_handler(event, context):
             "targets": [],
             "finding_count": 0,
             "findings": [],
+            "exception_count": 0,
+            "exceptions": [],
             "delete_action_count": 0,
             "delete_actions": [],
             "errors": [
@@ -944,7 +1021,7 @@ def lambda_handler(event, context):
     session = boto3.Session()
 
     if targets:
-        findings, errors = scan_targets(session, targets)
+        findings, exceptions, errors = scan_targets(session, targets)
         delete_actions = []
         if findings:
             actions, delete_errors = delete_findings(
@@ -964,6 +1041,8 @@ def lambda_handler(event, context):
             "targets": targets,
             "finding_count": len(findings),
             "findings": findings,
+            "exception_count": len(exceptions),
+            "exceptions": exceptions,
             "delete_action_count": len(delete_actions),
             "delete_actions": delete_actions,
             "status_wait_timeout_seconds": status_wait_timeout_seconds,
@@ -1045,7 +1124,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print_table(result["findings"])
+        print_table(result["findings"], result["exceptions"])
         if result["delete_actions"]:
             print()
             print(f"Delete requested for {result['delete_action_count']} resources.")

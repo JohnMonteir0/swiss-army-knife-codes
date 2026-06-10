@@ -59,6 +59,65 @@ class PolicyExceptionTests(unittest.TestCase):
         self.assertIsNotNone(finding)
         self.assertEqual(finding["identifier"], "shared-identifier")
 
+    def test_account_specific_exception_matches_identifier_and_account(self):
+        guardrail.POLICY_EXCEPTIONS["DBInstance"] = {
+            ("123456789012", "shared-instance")
+        }
+        resource = guardrail.resource_by_type("DBInstance")
+        item = {
+            "DBInstanceIdentifier": "shared-instance",
+            "DBInstanceArn": (
+                "arn:aws:rds:us-east-1:123456789012:db:shared-instance"
+            ),
+            "DBInstanceStatus": "available",
+            "Engine": "mysql",
+            "EngineVersion": "5.7.44",
+        }
+
+        exception = guardrail.policy_exception_from_item(
+            "us-east-1", resource, item
+        )
+
+        self.assertIsNone(guardrail.finding_from_item("us-east-1", resource, item))
+        self.assertEqual(exception["account_id"], "123456789012")
+        self.assertEqual(exception["result"], "EXCEPTION")
+
+    def test_account_specific_exception_does_not_match_another_account(self):
+        guardrail.POLICY_EXCEPTIONS["DBCluster"] = {
+            ("123456789012", "shared-cluster")
+        }
+        resource = guardrail.resource_by_type("DBCluster")
+        item = {
+            "DBClusterIdentifier": "shared-cluster",
+            "DBClusterArn": (
+                "arn:aws:rds:us-east-1:999999999999:cluster:shared-cluster"
+            ),
+            "Status": "available",
+            "Engine": "aurora-mysql",
+            "EngineVersion": "8.0.mysql_aurora.3.08.2",
+        }
+
+        finding = guardrail.finding_from_item("us-east-1", resource, item)
+
+        self.assertIsNotNone(finding)
+        self.assertIsNone(
+            guardrail.policy_exception_from_item("us-east-1", resource, item)
+        )
+
+    def test_compliant_resource_is_not_reported_as_an_exception(self):
+        guardrail.POLICY_EXCEPTIONS["DBInstance"] = {"current-instance"}
+        resource = guardrail.resource_by_type("DBInstance")
+        item = {
+            "DBInstanceIdentifier": "current-instance",
+            "DBInstanceStatus": "available",
+            "Engine": "mysql",
+            "EngineVersion": "8.4.7",
+        }
+
+        self.assertIsNone(
+            guardrail.policy_exception_from_item("us-east-1", resource, item)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
