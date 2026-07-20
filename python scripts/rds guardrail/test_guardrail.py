@@ -108,6 +108,29 @@ class PolicyExceptionTests(unittest.TestCase):
         self.assertEqual(exception["account_id"], "123456789012")
         self.assertEqual(exception["result"], "EXCEPTION")
 
+    def test_account_specific_instance_exception_does_not_match_another_account(self):
+        guardrail.POLICY_EXCEPTIONS["DBInstance"] = {
+            ("123456789012", "shared-instance")
+        }
+        resource = guardrail.resource_by_type("DBInstance")
+        item = {
+            "DBInstanceIdentifier": "shared-instance",
+            "DBInstanceArn": (
+                "arn:aws:rds:us-east-1:999999999999:db:shared-instance"
+            ),
+            "DBInstanceStatus": "available",
+            "Engine": "mysql",
+            "EngineVersion": "5.7.44",
+        }
+
+        finding = guardrail.finding_from_item("us-east-1", resource, item)
+
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["identifier"], "shared-instance")
+        self.assertIsNone(
+            guardrail.policy_exception_from_item("us-east-1", resource, item)
+        )
+
     def test_account_specific_exception_does_not_match_another_account(self):
         guardrail.POLICY_EXCEPTIONS["DBCluster"] = {
             ("123456789012", "shared-cluster")
