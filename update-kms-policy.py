@@ -5,23 +5,34 @@ import boto3
 
 kms = boto3.client("kms")
 
+# Edit the policy here before deploying the Lambda.
+#
+# Replace 123456789012 with your AWS account ID and add any other statements
+# required by your application. Keeping this in the source means the Lambda
+# invocation only needs to identify the KMS key to update.
+POLICY_CONFIG = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "EnableIAMUserPermissions",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::123456789012:root",
+            },
+            "Action": "kms:*",
+            "Resource": "*",
+        },
+    ],
+}
+
 
 def lambda_handler(event, context):
     key_id = event.get("key_id")
-    policy = event.get("policy")
 
     if not key_id:
         raise ValueError("event.key_id is required")
 
-    if not policy:
-        raise ValueError("event.policy is required")
-
-    # Accept either a JSON object or a JSON-formatted string.
-    if isinstance(policy, str):
-        policy = json.loads(policy)
-
-    if not isinstance(policy, dict):
-        raise ValueError("event.policy must be a JSON object or JSON string")
+    policy = POLICY_CONFIG
 
     if policy.get("Version") != "2012-10-17":
         raise ValueError("Policy Version must be 2012-10-17")
